@@ -554,15 +554,76 @@ private func spareTheSession(_ row: ProcessUsage) -> String? { row.usersOwn ? "y
 
 @Test func anAppsOwnHelpersAreLeftToTheAppOnQuit() {
     // Quitting an app quits its helpers itself (File > Quit); pausing reaches each one.
-    let rows = [row(1400, "Example", app: "Example"), row(1401, "Example Helper", parent: 1400, app: "Example"),
+    let rows = [row(1400, "Example", path: "/Applications/Example.app/Contents/MacOS/Example", app: "Example"),
+                row(1401, "Example Helper", parent: 1400,
+                    path: "/Applications/Example.app/Contents/Helpers/helper", app: "Example"),
                 row(1402, "sleep", parent: 1400)]
     let current = rows.map { identity($0) }
     let recorder = Recorder()
     _ = ProcessControl.perform(.quit, on: rows, current: current, signaller: recorder, terminator: recorder.terminator(true))
-    #expect(recorder.calls == ["\(SIGTERM) 1402", "terminate 1400"])
+    #expect(recorder.calls == ["terminate 1400", "\(SIGTERM) 1402"])
     let pausing = Recorder()
     _ = ProcessControl.perform(.pause, on: rows, current: current, signaller: pausing, terminator: pausing.terminator(true))
     #expect(pausing.calls == ["\(SIGSTOP) 1401", "\(SIGSTOP) 1402", "\(SIGSTOP) 1400"])
+}
+
+@Test(arguments: [ProcessControl.Action.quit, .forceQuit])
+func appQuitPrecedesALowerPidLaunchdHelper(_ action: ProcessControl.Action) {
+    let rows = [row(1390, "helper", path: "/Applications/Example.app/Contents/Helpers/helper", app: "Example"),
+                row(1400, "Example", path: "/Applications/Example.app/Contents/MacOS/Example", app: "Example")]
+    let recorder = Recorder()
+    let terminate: (Int32) -> Bool? = { pid in
+        recorder.calls.append("app \(pid)")
+        return pid == 1400 ? true : nil
+    }
+    let outcomes = ProcessControl.perform(action, on: rows, current: rows.map { identity($0) }, signaller: recorder,
+                                          terminator: AppTerminator(terminate: terminate, forceTerminate: terminate))
+    #expect(recorder.calls == ["app 1400", "app 1390", "\(action.signal) 1390"])
+    #expect(Set(outcomes.map(\.pid)) == [1390, 1400])
+}
+
+@Test(arguments: [ProcessControl.Action.quit, .forceQuit])
+func matchingAppNamesAtDifferentPathsDoNotSpareAChild(_ action: ProcessControl.Action) {
+    let rows = [row(1400, "Example", path: "/Applications/Example.app/Contents/MacOS/Example", app: "Example"),
+                row(1401, "child", parent: 1400, path: "/tmp/Example.app/child", app: "Example")]
+    let recorder = Recorder()
+    let terminate: (Int32) -> Bool? = { pid in
+        recorder.calls.append("app \(pid)")
+        return pid == 1400 ? true : nil
+    }
+    let outcomes = ProcessControl.perform(action, on: rows, current: rows.map { identity($0) }, signaller: recorder,
+                                          terminator: AppTerminator(terminate: terminate, forceTerminate: terminate))
+    #expect(recorder.calls == ["app 1400", "app 1401", "\(action.signal) 1401"])
+    #expect(Set(outcomes.map(\.pid)) == [1400, 1401])
+}
+
+@Test(arguments: [ProcessControl.Action.quit, .forceQuit])
+func anAppWithoutAnAcceptedQuitDoesNotHideItsHelpers(_ action: ProcessControl.Action) {
+    let rows = [row(1400, "Example", path: "/Applications/Example.app/Contents/MacOS/Example", app: "Example"),
+                row(1401, "helper", parent: 1400,
+                    path: "/Applications/Example.app/Contents/Helpers/helper", app: "Example")]
+    let recorder = Recorder()
+    let terminate: (Int32) -> Bool? = { pid in pid == 1400 ? false : nil }
+    let outcomes = ProcessControl.perform(action, on: rows, current: rows.map { identity($0) }, signaller: recorder,
+                                          terminator: AppTerminator(terminate: terminate, forceTerminate: terminate))
+    #expect(recorder.calls == ["\(action.signal) 1401"])
+    #expect(outcomes.contains(ProcessControl.Outcome(pid: 1400, result: .failure(.appRefused))))
+    #expect(outcomes.contains(ProcessControl.Outcome(pid: 1401, result: .success(()))))
+}
+
+@Test(arguments: [ProcessControl.Action.quit, .forceQuit])
+func appQuitRequestsStillGuardEveryPidAndStartTime(_ action: ProcessControl.Action) {
+    let path = "/Applications/Example.app/Contents/MacOS/Example"
+    let rows = [row(1, "launchd", path: path, app: "Example"), row(own, "Saur0n", path: path, app: "Example"),
+                row(1400, "reused", path: path, app: "Example"), row(1401, "gone", path: path, app: "Example")]
+    let current = [identity(rows[0]), identity(rows[1]), identity(rows[2], start: rows[2].startMicroseconds + 1)]
+    let recorder = Recorder()
+    let outcomes = ProcessControl.perform(action, on: rows, current: current, signaller: recorder,
+                                          terminator: recorder.terminator(true), ownPid: own)
+    #expect(recorder.calls.isEmpty)
+    #expect(outcomes.count == 4)
+    #expect(outcomes.contains(ProcessControl.Outcome(pid: 1400, result: .failure(.reused))))
+    #expect(outcomes.contains(ProcessControl.Outcome(pid: 1401, result: .failure(.gone))))
 }
 
 @Test func aWarningBarSparesTheUsersSessionAndTheExemptedAppleServicesAndNothingElse() {

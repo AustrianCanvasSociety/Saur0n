@@ -377,40 +377,37 @@ public enum ProcessControl {
         }
     }
 
-    /// `action` on every row in `order`, each checked against `current` (a process list read just before) by pid and
-    /// start time first, continuing past failures. On Quit and Force Quit a row inside the same app as a row above it
-    /// is left to that app, which ends its own helpers (Activity Monitor quits an app as one). A pid `refusal` names
-    /// is never signalled nor handed to the app terminator.
+    /// `action` checked against `current` by pid and start time, continuing past failures. Quit and Force Quit ask
+    /// apps first; only an accepted request leaves helpers in that exact bundle to the app. The remaining signals
+    /// run children first. A pid `refusal` names is never signalled nor handed to the app terminator.
     public static func perform(_ action: Action, on rows: [ProcessUsage], current: [ProcessIdentity],
                                signaller: ProcessSignaller, terminator: AppTerminator,
                                ownPid: Int32 = ProcessInfo.processInfo.processIdentifier) -> [Outcome] {
         let byPid = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
-        func leftToApp(_ row: ProcessUsage) -> Bool {
-            guard action == .quit || action == .forceQuit, let app = row.app else { return false }
-            var seen: Set<Int32> = [row.pid]
-            var up = byPid[row.ppid]
-            while let ancestor = up, seen.insert(ancestor.pid).inserted {
-                if ancestor.app == app { return true }
-                up = byPid[ancestor.ppid]
-            }
-            return false
-        }
         // Fresh identities retain the ancestry of wrappers that selection spared; the selected rows keep their links.
         var parent = Dictionary(current.map { ($0.pid, $0.ppid) }, uniquingKeysWith: { a, _ in a })
         for row in rows { parent[row.pid] = row.ppid }
-        return order(rows.map(\.pid), parent: parent).compactMap { pid in
-            guard let row = byPid[pid], !leftToApp(row) else { return nil }
+        let ordered = order(rows.map(\.pid), parent: parent)
+        var appAnswers: [Int32: Bool] = [:]
+        if action == .quit || action == .forceQuit {
+            // Parents before their helpers; no fallback signal until every app has had its quit request.
+            for pid in ordered.reversed() {
+                guard let row = byPid[pid], row.app != nil, refusal(pid, ownPid: ownPid) == nil,
+                      verify(ProcessTable.rowID(row), in: current) != nil else { continue }
+                if leftToApp(row, rows: byPid, answers: appAnswers) { continue }
+                appAnswers[pid] = action == .quit ? terminator.terminate(pid) : terminator.forceTerminate(pid)
+            }
+        }
+        return ordered.compactMap { pid in
+            guard let row = byPid[pid] else { return nil }
             if let reason = refusal(pid, ownPid: ownPid) { return Outcome(pid: pid, result: .failure(.refused(reason: reason))) }
             guard verify(ProcessTable.rowID(row), in: current) != nil else {
                 return Outcome(pid: pid, result: .failure(current.contains { $0.pid == pid } ? .reused : .gone))
             }
-            let answer: Bool?
-            switch means(for: action, row: row) {
-            case .terminateApp: answer = terminator.terminate(pid)
-            case .forceTerminateApp: answer = terminator.forceTerminate(pid)
-            case .signal: answer = nil
+            if let answer = appAnswers[pid] {
+                return Outcome(pid: pid, result: answer ? .success(()) : .failure(.appRefused))
             }
-            if let answer { return Outcome(pid: pid, result: answer ? .success(()) : .failure(.appRefused)) }
+            if leftToApp(row, rows: byPid, answers: appAnswers) { return nil }
             do {
                 try signaller.signal(action.signal, to: pid)
                 return Outcome(pid: pid, result: .success(()))
@@ -420,6 +417,24 @@ public enum ProcessControl {
                 return Outcome(pid: pid, result: .failure(.failed(errno: EINVAL)))
             }
         }
+    }
+
+    private static func leftToApp(_ row: ProcessUsage, rows: [Int32: ProcessUsage], answers: [Int32: Bool]) -> Bool {
+        guard !answers.isEmpty, let bundle = appBundle(row) else { return false }
+        var seen: Set<Int32> = [row.pid], up = rows[row.ppid]
+        while let ancestor = up, seen.insert(ancestor.pid).inserted {
+            if answers[ancestor.pid] == true, appBundle(ancestor) == bundle { return true }
+            up = rows[ancestor.ppid]
+        }
+        return false
+    }
+
+    /// Full outer bundle path, not the display name: a different Example.app is not this app's helper.
+    private static func appBundle(_ row: ProcessUsage) -> String? {
+        guard row.app != nil, let path = row.path, path.hasPrefix("/") else { return nil }
+        let parts = path.split(separator: "/")
+        guard let app = parts.firstIndex(where: { $0.lowercased().hasSuffix(".app") && $0.count > 4 }) else { return nil }
+        return "/" + parts[...app].joined(separator: "/")
     }
 
     /// What the sheet says when `error` stopped the action on `name` (pid `pid`).
