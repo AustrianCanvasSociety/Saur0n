@@ -65,12 +65,12 @@ private func expectPartition(_ rows: [ProcessUsage], _ groups: [CommandGroup]) {
     ] {
         #expect(cpu == 0.4375 && exited == 0.75)
         #expect(memory == (overflow ? 10 : 111))
-        #expect(disk == DiskUsage(rate: DiskRate(readBytesPerSecond: overflow ? 10 : 111,
-                                               writeBytesPerSecond: overflow ? 11 : 112),
-                                  bytes: DiskBytes(read: overflow ? 12 : 113, written: overflow ? 13 : 114)))
-        #expect(network == NetworkUsage(rate: NetworkRate(inBytesPerSecond: overflow ? 20 : 121,
-                                                         outBytesPerSecond: overflow ? 21 : 122),
-                                        bytes: NetworkBytes(received: overflow ? 22 : 123, sent: overflow ? 23 : 124)))
+        #expect(disk == DiskUsage(rate: DiskRate(readBytesPerSecond: overflow ? .max : 111,
+                                               writeBytesPerSecond: overflow ? .max : 112),
+                                  bytes: DiskBytes(read: overflow ? .max : 113, written: overflow ? .max : 114)))
+        #expect(network == NetworkUsage(rate: NetworkRate(inBytesPerSecond: overflow ? .max : 121,
+                                                         outBytesPerSecond: overflow ? .max : 122),
+                                        bytes: NetworkBytes(received: overflow ? .max : 123, sent: overflow ? .max : 124)))
     }
 }
 

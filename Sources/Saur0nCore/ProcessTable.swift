@@ -176,9 +176,11 @@ public enum ProcessTable {
         /// `subgroup:<group key>:command:<name>` / `subgroup:<group key>:other`,
         /// `process:<pid>:<start>`, `unattributed`.
         public let id: String
-        /// The accessibility identifier `scripts/read-window.swift` reads: `group-<n>` (n = its place in the
-        /// table, from 0), `subgroup-<n>-<m>` (m = its place among the group's sub-group lines, from 0),
-        /// `process-<pid>`, `unattributed`; `gone-` before it on a greyed line.
+        /// Accessibility key: `group-<n>` (n = its place in the table, from 0), `subgroup-<n>-<m>` (m = its
+        /// place among the group's sub-group lines, from 0), `process-<pid>`, `unattributed`; `gone-` before it
+        /// on a greyed line. The window applies group and sub-group keys to title cells, `unattributed` to the
+        /// CPU cell. `process-<pid>` identifies the PID cell, not a process-row AX element; the other process
+        /// cells use `name-<pid>`, `cpu-<pid>`, `memory-<pid>`, etc. through `cellIdentifier(_:)`.
         public internal(set) var identifier: String
         public let kind: Kind
         /// A group's title; a sub-group's app, command or "N other processes"; a process's raw name, escaped
@@ -309,53 +311,8 @@ public enum ProcessTable {
                              pausedPids: Set<Int32> = [], now: Double = 0, previous: [Line] = [],
                              warnings: [Warning] = []) -> [Line] {
         let byPid = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
-        func member(_ row: ProcessUsage, depth: Int) -> Line {
-            var readable = ProcessSample.readableText(row)
-            if row.pid == 0, let kernelTaskAge { readable = (readable.map { $0 + " · " } ?? "") + "read \(kernelTaskAge) s ago" }
-            let key = rowID(row)
-            var line = Line(id: "process:\(key.pid):\(key.startMicroseconds)", identifier: "process-\(row.pid)", kind: .process,
-                        name: TextFormat.displaySafe(row.name), app: row.app, readableName: readable.map(TextFormat.displaySafe),
-                        worktree: row.repo?.worktree.map { TextFormat.displaySafe(RepoResolver.basename($0)) },
-                        orphaned: row.orphaned, depth: depth, cpuPercent: row.cpuPercent, exitedChildrenCpuPercent: row.exitedChildrenCpuPercent,
-                        residentBytes: row.residentBytes, disk: row.disk, network: row.network,
-                        user: TextFormat.displaySafe(row.user), pid: row.pid, rowID: key,
-                        session: row.session.map { TextFormat.displaySafe($0.name) })
-            line.paused = pausedPids.contains(row.pid)
-            return line
-        }
-        /// `rank`: 0 a repo or session, 1 the VMs, 2 a catch-all — the order a header sort keeps.
-        typealias Section = (key: String, name: String, title: String, total: Double, bytes: UInt64, disk: DiskUsage,
-                             network: NetworkUsage, pids: [Int32], depths: [Int32: Int], rank: Int,
-                             subgroups: [CatchAllBreakout.Subgroup])
-        let sections: [Section]
-        // One parent map for every group's depths, which only the CLI order shows.
-        let parents = sort == .cliOrder && grouping != .repo ? CommandGroups.parents(rows) : [:]
-        switch grouping {
-        case .repo:
-            sections = zip(repoGroups, ProcessSample.titles(repoGroups)).map { group, title in
-                let rank = group.root != nil ? 0 : group.name == RepoGroups.vms ? 1 : 2
-                return (group.root.map { "repo:" + $0 } ?? (rank == 1 ? "vms" : "catch-all:" + group.name), group.name,
-                        title, group.totalCpuPercent, group.residentBytes, group.disk, group.network, group.pids, [:],
-                        rank, group.subgroups)
-            }
-        case .session:
-            sections = zip(sessionGroups, ProcessSample.titles(sessionGroups)).map { group, title in
-                let rank = group.kind != nil ? 0 : group.name == SessionGroups.vms ? 1 : 2
-                return (group.kind.map { "\($0.rawValue):\(group.id ?? "")" } ?? (rank == 1 ? "vms" : "catch-all:" + group.name),
-                        group.name, title, group.totalCpuPercent, group.residentBytes, group.disk, group.network,
-                        group.pids,
-                        sort == .cliOrder && group.subgroups.isEmpty ? CommandGroups.depths(group.pids, parents: parents) : [:],
-                        rank,
-                        group.subgroups)
-            }
-        case .command:
-            // No catch-alls and no VMs group: every group is a command, sorted by the column under a header sort.
-            sections = commandGroups.map { group in
-                ("command:" + group.name, group.name, TextFormat.copiesTitle(name: group.name, copies: group.copies),
-                 group.totalCpuPercent, group.residentBytes, group.disk, group.network, group.pids,
-                 sort == .cliOrder ? CommandGroups.depths(group.pids, parents: parents) : [:], 0, [])
-            }
-        }
+        let sections = sections(rows: rows, repoGroups: repoGroups, sessionGroups: sessionGroups,
+                                commandGroups: commandGroups, grouping: grouping, sort: sort)
         // Which section each warning pins: in its own grouping its group by name, else (or when that is not shown) the
         // section holding its busiest process; the Machine line none (plan § Decisions: "a warned group pins to the top").
         var pins: [String: [Int]] = [:]
@@ -370,38 +327,9 @@ public enum ProcessTable {
             else { continue }
             pins[section.key, default: []].append(i)
         }
-        /// `lines` in the CLI's order, or by the column under a header sort, `last` kept at the end.
-        func sorted(_ lines: [Line], keepingLast last: Line? = nil) -> [Line] {
-            guard sort != .cliOrder else { return lines + (last.map { [$0] } ?? []) }
-            return lines.enumerated().sorted { ordered($0.element, $1.element, by: sort, tie: $0.offset < $1.offset) }
-                .map(\.element) + (last.map { [$0] } ?? [])
-        }
-        func subgroupLine(_ subgroup: CatchAllBreakout.Subgroup, groupKey: String) -> Line {
-            let members = subgroup.pids.compactMap { byPid[$0].map { member($0, depth: 0) } }
-            return Line(id: "subgroup:\(groupKey):" + (subgroup.kind == .other ? "other" : "\(subgroup.kind.rawValue):\(subgroup.name)"),
-                        identifier: "", kind: .subgroup, name: TextFormat.displaySafe(subgroup.name),
-                        cpuPercent: subgroup.totalCpuPercent, residentBytes: subgroup.residentBytes, disk: subgroup.disk,
-                        network: subgroup.network, count: subgroup.pids.count, startsOpen: false,
-                        children: sort == .cliOrder ? members : members.sorted { ordered($0, $1, by: sort) })
-        }
         var groups = sections.map { section in
-            var children: [Line]
-            if section.subgroups.isEmpty {
-                children = section.pids.compactMap { pid in byPid[pid].map { member($0, depth: section.depths[pid] ?? 0) } }
-                if sort != .cliOrder { children.sort { ordered($0, $1, by: sort) } }
-            } else {
-                // A catch-all: its lifted sub-groups and bare rows, then the other line, which a sort keeps last.
-                var lifted: [Line] = [], other: Line?
-                for entry in CatchAllBreakout.entries(pids: section.pids, subgroups: section.subgroups) {
-                    switch entry {
-                    case .process(let pid): if let row = byPid[pid] { lifted.append(member(row, depth: 0)) }
-                    case .subgroup(let subgroup) where subgroup.kind == .other:
-                        other = subgroupLine(subgroup, groupKey: section.key)
-                    case .subgroup(let subgroup): lifted.append(subgroupLine(subgroup, groupKey: section.key))
-                    }
-                }
-                children = sorted(lifted, keepingLast: other)
-            }
+            let children = children(section, byPid: byPid, sort: sort, kernelTaskAge: kernelTaskAge,
+                                    pausedPids: pausedPids)
             var line = Line(id: "group:\(section.key)", identifier: "", kind: .group, name: section.title,
                             cpuPercent: section.total, residentBytes: section.bytes, disk: section.disk,
                             network: section.network, count: section.pids.count,
@@ -444,6 +372,98 @@ public enum ProcessTable {
                             disk: unattributedDisk.map { DiskUsage(rate: $0, bytes: .zero) }))
         }
         return out
+    }
+
+    fileprivate static func member(_ row: ProcessUsage, depth: Int, kernelTaskAge: Int?, pausedPids: Set<Int32>) -> Line {
+        var readable = ProcessSample.readableText(row)
+        if row.pid == 0, let kernelTaskAge { readable = (readable.map { $0 + " · " } ?? "") + "read \(kernelTaskAge) s ago" }
+        let key = rowID(row)
+        var line = Line(id: "process:\(key.pid):\(key.startMicroseconds)", identifier: "process-\(row.pid)", kind: .process,
+                        name: TextFormat.displaySafe(row.name), app: row.app, readableName: readable.map(TextFormat.displaySafe),
+                        worktree: row.repo?.worktree.map { TextFormat.displaySafe(RepoResolver.basename($0)) },
+                        orphaned: row.orphaned, depth: depth, cpuPercent: row.cpuPercent, exitedChildrenCpuPercent: row.exitedChildrenCpuPercent,
+                        residentBytes: row.residentBytes, disk: row.disk, network: row.network,
+                        user: TextFormat.displaySafe(row.user), pid: row.pid, rowID: key,
+                        session: row.session.map { TextFormat.displaySafe($0.name) })
+        line.paused = pausedPids.contains(row.pid)
+        return line
+    }
+
+    /// `rank`: 0 a repo or session, 1 the VMs, 2 a catch-all — the order a header sort keeps.
+    fileprivate typealias Section = (key: String, name: String, title: String, total: Double, bytes: UInt64, disk: DiskUsage,
+                                    network: NetworkUsage, pids: [Int32], depths: [Int32: Int], rank: Int,
+                                    subgroups: [CatchAllBreakout.Subgroup])
+
+    fileprivate static func sections(rows: [ProcessUsage], repoGroups: [RepoGroup], sessionGroups: [SessionGroup],
+                                     commandGroups: [CommandGroup], grouping: Grouping, sort: Sort) -> [Section] {
+        // One parent map for every group's depths, which only the CLI order shows.
+        let parents = sort == .cliOrder && grouping != .repo ? CommandGroups.parents(rows) : [:]
+        switch grouping {
+        case .repo:
+            return zip(repoGroups, ProcessSample.titles(repoGroups)).map { group, title in
+                let rank = group.root != nil ? 0 : group.name == RepoGroups.vms ? 1 : 2
+                return (group.root.map { "repo:" + $0 } ?? (rank == 1 ? "vms" : "catch-all:" + group.name), group.name,
+                        title, group.totalCpuPercent, group.residentBytes, group.disk, group.network, group.pids, [:],
+                        rank, group.subgroups)
+            }
+        case .session:
+            return zip(sessionGroups, ProcessSample.titles(sessionGroups)).map { group, title in
+                let rank = group.kind != nil ? 0 : group.name == SessionGroups.vms ? 1 : 2
+                return (group.kind.map { "\($0.rawValue):\(group.id ?? "")" } ?? (rank == 1 ? "vms" : "catch-all:" + group.name),
+                        group.name, title, group.totalCpuPercent, group.residentBytes, group.disk, group.network,
+                        group.pids,
+                        sort == .cliOrder && group.subgroups.isEmpty ? CommandGroups.depths(group.pids, parents: parents) : [:],
+                        rank,
+                        group.subgroups)
+            }
+        case .command:
+            // No catch-alls and no VMs group: every group is a command, sorted by the column under a header sort.
+            return commandGroups.map { group in
+                ("command:" + group.name, group.name, TextFormat.copiesTitle(name: group.name, copies: group.copies),
+                 group.totalCpuPercent, group.residentBytes, group.disk, group.network, group.pids,
+                 sort == .cliOrder ? CommandGroups.depths(group.pids, parents: parents) : [:], 0, [])
+            }
+        }
+    }
+
+    fileprivate static func subgroupLine(_ subgroup: CatchAllBreakout.Subgroup, groupKey: String,
+                                        byPid: [Int32: ProcessUsage], sort: Sort, kernelTaskAge: Int?, pausedPids: Set<Int32>) -> Line {
+        let members = subgroup.pids.compactMap { pid in
+            byPid[pid].map { member($0, depth: 0, kernelTaskAge: kernelTaskAge, pausedPids: pausedPids) }
+        }
+        return Line(id: "subgroup:\(groupKey):" + (subgroup.kind == .other ? "other" : "\(subgroup.kind.rawValue):\(subgroup.name)"),
+                    identifier: "", kind: .subgroup, name: TextFormat.displaySafe(subgroup.name),
+                    cpuPercent: subgroup.totalCpuPercent, residentBytes: subgroup.residentBytes, disk: subgroup.disk,
+                    network: subgroup.network, count: subgroup.pids.count, startsOpen: false,
+                    children: sort == .cliOrder ? members : members.sorted { ordered($0, $1, by: sort) })
+    }
+
+    fileprivate static func children(_ section: Section, byPid: [Int32: ProcessUsage], sort: Sort,
+                                     kernelTaskAge: Int?, pausedPids: Set<Int32>) -> [Line] {
+        if section.subgroups.isEmpty {
+            let members = section.pids.compactMap { pid in
+                byPid[pid].map { member($0, depth: section.depths[pid] ?? 0, kernelTaskAge: kernelTaskAge, pausedPids: pausedPids) }
+            }
+            return sort == .cliOrder ? members : members.sorted { ordered($0, $1, by: sort) }
+        }
+        // A catch-all: its lifted sub-groups and bare rows, then the other line, which a sort keeps last.
+        var lifted: [Line] = [], other: Line?
+        for entry in CatchAllBreakout.entries(pids: section.pids, subgroups: section.subgroups) {
+            switch entry {
+            case .process(let pid):
+                guard let row = byPid[pid] else { continue }
+                lifted.append(member(row, depth: 0, kernelTaskAge: kernelTaskAge, pausedPids: pausedPids))
+            case .subgroup(let subgroup):
+                let line = subgroupLine(subgroup, groupKey: section.key, byPid: byPid, sort: sort,
+                                        kernelTaskAge: kernelTaskAge, pausedPids: pausedPids)
+                if subgroup.kind == .other { other = line } else { lifted.append(line) }
+            }
+        }
+        if sort != .cliOrder {
+            lifted = lifted.enumerated().sorted { ordered($0.element, $1.element, by: sort, tie: $0.offset < $1.offset) }
+                .map(\.element)
+        }
+        return lifted + (other.map { [$0] } ?? [])
     }
 
     /// How long a greyed line stays: the graphs' minute.

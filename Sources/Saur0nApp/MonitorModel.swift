@@ -13,7 +13,7 @@ final class MonitorModel {
     /// Where the Cores row's open state is remembered (the app's own defaults domain).
     static let coresOpenKey = "coresOpen"
 
-    let topology: CoreTopology?
+    private(set) var topology: CoreTopology?
     private(set) var history: CPUHistory?
     /// The last read that failed — topology at launch, the CPU load, the process scan or a disk or network read
     /// since — or nil.
@@ -58,7 +58,8 @@ final class MonitorModel {
 
     /// Refreshes applied so far. The window shows it to accessibility so a reader can tell whether its reads
     /// all came from one refresh (`scripts/read-window.swift`).
-    private(set) var refreshes = 0
+    private var refreshProgress = RefreshProgress()
+    var refreshes: Int { refreshProgress.count }
     /// The table as shown: the last refresh's rows under `grouping`, sorted by `sortOrder`; under a sort by Name, PID,
     /// User or Session in the order the table had, until the sort, the grouping, a fold or Refresh changes it, ended
     /// processes greyed for a minute.
@@ -115,22 +116,12 @@ final class MonitorModel {
     init() {
         coresOpen = UserDefaults.standard.bool(forKey: Self.coresOpenKey)
         openGraph = OpenGraph(saved: UserDefaults.standard.string(forKey: Self.openGraphKey))
-        let topology: CoreTopology
-        do {
-            topology = try SystemReaders.coreTopology()
-        } catch {
-            self.topology = nil
-            self.error = "cannot read core topology: \(error)"
-            return
-        }
-        self.topology = topology
-        history = CPUHistory(topology: topology)
         watchVisibility()
         watchMenus()
         resumePausedOnQuit()
         // The model lives as long as the app, so the task holds it for good.
-        Task.detached(priority: .utility) { [self, topology] in
-            await Self.sample(into: self, topology: topology)
+        Task.detached(priority: .utility) { [self] in
+            await Self.sample(into: self)
         }
     }
 
@@ -211,26 +202,25 @@ final class MonitorModel {
     /// the loop waits; the sample after a pause only opens a new window, so no refresh covers the pause. Refresh
     /// ends the second's wait at once, or while paused lets one reading through (`RefreshPause.refreshNow`). The
     /// reading's graph and strip points are built here too, off the main actor.
-    private nonisolated static func sample(into model: MonitorModel, topology: CoreTopology) async {
-        var ticks = TickSampler()
-        var refresher = ProcessRefresher(topology: topology)
+    private nonisolated static func sample(into model: MonitorModel) async {
+        var sampler = LoadSampler()
+        var refresher: ProcessRefresher?
         // The watcher (Phase 7 Step 1) rides this loop, which starts with the app: detection never waits on a window,
         // and the LaunchAgent's `--watch` start is the same loop with no window at all. What the last run left paused
         // resumes before the first tick, whatever ended it.
-        var watcher = WatcherModel(ledgerURL: PauseLedger.defaultURL())
-        do {
-            try watcher.resumeOnStart(current: try? ProcessControl.currentIdentities(), signaller: KillSignaller())
-        } catch {
-            log.error("pause ledger not saved at start: \(error.localizedDescription)")
-        }
+        var watcher = resumedWatcher()
         var reportedLedgerError: String?
         var reportedStatusError: String?
         let statusPublisher = ResourceStatusProducer(url: ResourceStatusProducer.defaultURL())
         while !Task.isCancelled {
             let held = await model.pause.waitWhilePaused()
             let ignoring = await model.ignoring
-            let load = Result { try SystemReaders.cpuTicks() }.flatMap { tick in Result { try ticks.next(tick) } }
-            let processes = Result { try refresher.next(load: try load.get(), ignoring: ignoring, watcher: &watcher) }
+            let load = Result { try sampler.next(topology: SystemReaders.coreTopology, ticks: SystemReaders.cpuTicks) }
+            if let topology = sampler.topology {
+                if refresher == nil { refresher = ProcessRefresher(topology: topology) }
+                refresher?.topology = topology
+            }
+            let processes = Result { try refresher?.next(load: try load.get(), ignoring: ignoring, watcher: &watcher) }
             var sampledAt: Date?
             var level: ResourceLevel?
             if case .success(let refresh?) = processes {
@@ -272,10 +262,21 @@ final class MonitorModel {
                 }
             }
             if !held {
-                await model.deliver(Reading(load: load, processes: processes, sampledAt: sampledAt, level: level))
+                await model.deliver(Reading(load: load, processes: processes, topology: sampler.topology,
+                                            sampledAt: sampledAt, level: level))
             }
             await model.pause.sleep(seconds: 1)
         }
+    }
+
+    private nonisolated static func resumedWatcher() -> WatcherModel {
+        var watcher = WatcherModel(ledgerURL: PauseLedger.defaultURL())
+        do {
+            try watcher.resumeOnStart(current: try? ProcessControl.currentIdentities(), signaller: KillSignaller())
+        } catch {
+            log.error("pause ledger not saved at start: \(error.localizedDescription)")
+        }
+        return watcher
     }
 
     /// One completed tick's live status, published under `machine` when this Mac is activated: the figures of this
@@ -354,27 +355,30 @@ final class MonitorModel {
             return
         }
         do {
-            if let refresh = try reading.processes.get() {
-                latest = refresh
-                if !refresh.problems.isEmpty { error = refresh.problems.joined(separator: "; ") }
-                ignoredGroups.formIntersection(refresh.raised)
-                let ignoring = ignoring
-                let inForce = refresh.warnings.filter { !ignoring.contains($0.subject) }
-                if inForce != warnings { warnings = inForce }
-                if refresh.spikes != spikes { spikes = refresh.spikes }
-                spikesEnd = refresh.end
-            }
+            guard let refresh = try refreshProgress.accept(reading.processes) else { return }
+            latest = refresh
+            if !refresh.problems.isEmpty { error = refresh.problems.joined(separator: "; ") }
+            ignoredGroups.formIntersection(refresh.raised)
+            let ignoring = ignoring
+            let inForce = refresh.warnings.filter { !ignoring.contains($0.subject) }
+            if inForce != warnings { warnings = inForce }
+            if refresh.spikes != spikes { spikes = refresh.spikes }
+            spikesEnd = refresh.end
         } catch {
             self.error = "cannot read processes: \(error)"
+            return
         }
         refreshPausedRows()
         rebuildLines(keepingOrder: !resortNextReading)
         resortNextReading = false
-        refreshes += 1
     }
 
     /// One point on each graph and one tick of each strip.
     private func append(_ points: GraphPoints) throws {
+        if topology != points.topology {
+            topology = points.topology
+            history = CPUHistory(topology: points.topology)
+        }
         try history?.append(points.load)
         loadHistory.append(split: points.load.split, load: points.loadAverage, launches: points.launches)
         if let disk = points.disk { diskHistory.append(disk.readBytesPerSecond, disk.writeBytesPerSecond) }
@@ -633,10 +637,12 @@ final class MonitorModel {
             pending = sheet
             return
         }
-        let command = live.compactMap { try? ProcessControl.administratorCommand(signal: sheet.action.signal, pid: $0.pid,
-                                                                                  ownPid: Self.ownPid) }
-            .joined(separator: "; ")
-        guard !command.isEmpty else { return }
+        let batch = ProcessControl.AdministratorBatch(signal: sheet.action.signal, rows: live, ownPid: Self.ownPid)
+        guard let command = batch.command else {
+            sheet.error = batch.error
+            pending = sheet
+            return
+        }
         var failure: NSDictionary?
         NSAppleScript(source: "do shell script \"\(command)\" with administrator privileges")?.executeAndReturnError(&failure)
         if let failure {
@@ -901,13 +907,15 @@ struct Reading: Sendable {
     /// The level the engine named for this reading; nil while its calibration is pending.
     let level: ResourceLevel?
 
-    init(load: Result<CPULoad?, Error>, processes: Result<ProcessRefresh?, Error>, sampledAt: Date? = nil,
-         level: ResourceLevel? = nil) {
+    init(load: Result<CPULoad?, Error>, processes: Result<ProcessRefresh?, Error>, topology: CoreTopology?,
+         sampledAt: Date? = nil, level: ResourceLevel? = nil) {
         self.load = load
         self.processes = processes
         self.sampledAt = sampledAt
         self.level = level
-        points = (try? load.get()).map { GraphPoints(load: $0, refresh: try? processes.get()) }
+        points = (try? load.get()).flatMap { load in
+            topology.map { GraphPoints(load: load, refresh: try? processes.get(), topology: $0) }
+        }
     }
 }
 
@@ -915,7 +923,7 @@ struct Reading: Sendable {
 /// the strips need are built off the main actor; while the window is quiet these are all it keeps of a reading.
 struct GraphPoints: Sendable {
     /// One grouping's strips: the five largest by memory, and each line's bytes this tick (its rate over the tick's
-    /// length — the machine disk reads' interval for disk, the `nettop` reads' for network).
+    /// length — the process scans' interval for disk, the `nettop` reads' for network).
     struct Strip: Sendable {
         let largestByMemory: [TopMovers.Mover]
         let disk: [TopMovers.Mover]
@@ -923,29 +931,30 @@ struct GraphPoints: Sendable {
     }
 
     let load: CPULoad
+    let topology: CoreTopology
     let loadAverage: LoadAverage?
     let launches: LaunchRate?
-    let disk: DiskUsage?
-    let network: NetworkUsage?
+    let disk: DiskRate?
+    let network: NetworkRate?
     let memory: MemoryUsage?
     /// Empty when the process read failed: the strips do not tick.
     let strips: [ProcessTable.Grouping: Strip]
 
-    init(load: CPULoad, refresh: ProcessRefresh?) {
+    init(load: CPULoad, refresh: ProcessRefresh?, topology: CoreTopology) {
         self.load = load
+        self.topology = topology
         loadAverage = refresh?.loadAverage
         launches = refresh?.launches
-        disk = refresh?.disk
-        network = refresh?.network
+        disk = refresh?.tickDisk
+        network = refresh?.tickNetwork
         memory = refresh?.memory
         var strips: [ProcessTable.Grouping: Strip] = [:]
         if let refresh {
-            let diskSeconds = refresh.diskWindow.map { $0.end - $0.start } ?? 1
             for grouping in ProcessTable.Grouping.allCases {
                 let lines = ProcessTable.flattened(MonitorModel.lines(refresh, grouping: grouping, sort: .cliOrder))
                 strips[grouping] = Strip(
                     largestByMemory: TopMovers.largest(lines, by: \.residentBytes),
-                    disk: TopMovers.rows(lines, seconds: diskSeconds, rate: \.diskBytesPerSecond),
+                    disk: TopMovers.rows(lines, seconds: refresh.intervalSeconds, rate: \.diskBytesPerSecond),
                     network: refresh.nettopSeconds.map { TopMovers.rows(lines, seconds: $0, rate: \.networkBytesPerSecond) } ?? [])
             }
         }
@@ -958,7 +967,7 @@ struct GraphPoints: Sendable {
 /// 30th refresh and finished on the next (`ProcessReaders.KernelTaskSchedule`); repo lookups and tmux panes kept
 /// for 10 refreshes.
 struct ProcessRefresher {
-    let topology: CoreTopology
+    var topology: CoreTopology
     private var scanner = ProcessScanner()
     private var descriptions: DescriptionSources?
     private var kernelTask = ProcessReaders.KernelTaskSchedule()
@@ -966,7 +975,8 @@ struct ProcessRefresher {
     /// Repo lookups kept for 10 refreshes: a new process's repo shows at once, a `.git` made since within 10 s.
     private var resolvers = KeptResolver()
     private var orphanGroups = KeptOrphanGroups()
-    /// tmux panes, read on the same 10-refresh cadence: a new pane's session shows within 10 s.
+    /// tmux panes, read every 10 refreshes: a new pane's session shows within 10 s.
+    private static let tmuxRefreshInterval = 10
     private var tmuxPanes: [Int32: String]?
     /// Arguments kept across refreshes except for shells and interpreters, which can exec another script;
     /// terminal names kept while the process lives. Reading every process again was a fifth of the app's cost
@@ -974,23 +984,20 @@ struct ProcessRefresher {
     private var arguments = KeptPerProcess<ProcessArguments>()
     private var terminalNames = KeptPerProcess<String>()
     private var refresh = 0
-    /// The last successful machine disk, machine network and `nettop` reads: each refresh's rates run from them.
-    private var lastDisk: MachineDiskSample?
-    private var lastNetwork: MachineNetworkSample?
+    /// Rows keep the last machine rates on failure; graphs and live status take only this tick's successful reads.
+    private var diskReading = RateReading<DiskBytes, DiskUsage>()
+    private var networkReading = RateReading<NetworkBytes, NetworkUsage>()
+    private var disk: DiskUsage? { diskReading.latest }
+    private var network: NetworkUsage? { networkReading.latest }
+    private var tickDisk: DiskRate? { diskReading.tick?.rate }
+    private var tickNetwork: NetworkRate? { networkReading.tick?.rate }
+    private var diskWindow: DiskWindow? { diskReading.window }
+    private var networkWindow: NetworkWindow? { networkReading.window }
     private var lastNettop: NettopRead?
-    /// The last rates computed, kept on the rows and graphs for a refresh whose read failed.
-    private var disk: DiskUsage?
-    private var network: NetworkUsage?
-    /// This tick's own machine disk and network rates, for the live status: nil while that read fails, where `disk`
-    /// and `network` keep the last rates for the graphs. A tick's document never carries a kept figure.
-    private var tickDisk: DiskRate?
-    private var tickNetwork: NetworkRate?
     /// The fixed levels' engine (Phase 7 Step 2), driven on the warnings' tick. The default-off selection below
     /// resets its holds and projection whenever the resource-alert switch changes.
     private var levels = ResourceLevelEngine()
     private var perProcessNetwork: [Int32: NetworkUsage]?
-    private var diskWindow: DiskWindow?
-    private var networkWindow: NetworkWindow?
     private var nettopSeconds: Double?
     /// The warnings and spike marks, run on every reading, the window quiet or not (Phase 6 Step 6). Floors: CPU 25
     /// points of the machine, Disk 50 MB/s, Network 10 MB/s above the minute's median. The warnings' engine moved to
@@ -1010,31 +1017,16 @@ struct ProcessRefresher {
     /// last rates and names itself in the returned problems.
     mutating func readDiskAndNetwork() -> [String] {
         var problems: [String] = []
-        // Each tick starts with no own figure: only a successful read over two samples sets one.
-        tickDisk = nil
         do {
-            let now = try MachineDiskReader.read()
-            if let lastDisk {
-                let usage = DiskActivity.usage(before: lastDisk, after: now)
-                disk = usage
-                diskWindow = DiskWindow(before: lastDisk, after: now)
-                tickDisk = usage.rate
-            }
-            lastDisk = now
+            diskReading.record(try MachineDiskReader.read(), measure: DiskActivity.usage)
         } catch {
+            diskReading.record(nil, measure: DiskActivity.usage)
             problems.append("cannot read disk activity: \(error)")
         }
-        tickNetwork = nil
         do {
-            let now = try MachineNetworkReader.read()
-            if let lastNetwork {
-                let usage = NetworkActivity.usage(before: lastNetwork, after: now)
-                network = usage
-                networkWindow = NetworkWindow(before: lastNetwork, after: now)
-                tickNetwork = usage.rate
-            }
-            lastNetwork = now
+            networkReading.record(try MachineNetworkReader.read(), measure: NetworkActivity.usage)
         } catch {
+            networkReading.record(nil, measure: NetworkActivity.usage)
             problems.append("cannot read network activity: \(error)")
         }
         do {
@@ -1062,13 +1054,7 @@ struct ProcessRefresher {
         let memorySample = readMemory(problems: &problems)
         let memory = memorySample?.usage
         let available = memorySample?.available
-        if let pendingTop {
-            self.pendingTop = nil
-            kernelTask.record(try pendingTop.finish(), atNanoseconds: DispatchTime.now().uptimeNanoseconds)
-        }
-        if ProcessReaders.KernelTaskSchedule.isDue(refresh: refresh) {
-            pendingTop = try ProcessReaders.KernelTaskSampler.start(interval: 1)
-        }
+        readKernelTask(problems: &problems)
         let scan = try ProcessReaders.sample(workingDirectories: true, keptArguments: &arguments)
         if descriptions == nil { descriptions = DescriptionSources.load(for: scan) } else { descriptions?.extend(for: scan) }
         guard let window = scanner.next(scan), let load else { return nil }
@@ -1076,7 +1062,7 @@ struct ProcessRefresher {
         let rows = try ProcessSample.usage(before: window.before, after: window.after, cpuCount: load.perCPU.count,
                                            kernelTask: kernelTask.latest, describe: describe, network: perProcessNetwork)
         let resolver = resolvers.next()
-        if tmuxPanes == nil || refresh % KeptResolver.every == 0 { tmuxPanes = SystemReaders.tmuxPanes() }
+        if tmuxPanes == nil || refresh % Self.tmuxRefreshInterval == 0 { tmuxPanes = SystemReaders.tmuxPanes() }
         let logins = Set(SessionGroups.terminalLogins(rows))
         let ttys = terminalNames.values(for: scan.processes.filter { logins.contains($0.pid) },
                                         read: SystemReaders.ttyName(pid:))
@@ -1124,6 +1110,23 @@ struct ProcessRefresher {
                               end: end, dock: dock,
                               snapshotInput: SnapshotInput(snapshot: shown, scan: scan, history: machineHistory.points, end: now),
                               snapshotTrigger: trigger)
+    }
+
+    /// `top` is supplementary: a launch, exit or parse failure must not discard this tick's process scan.
+    private mutating func readKernelTask(problems: inout [String]) {
+        if let pendingTop {
+            self.pendingTop = nil
+            let result = Result { try pendingTop.finish() }
+            if let problem = kernelTask.record(result, atNanoseconds: DispatchTime.now().uptimeNanoseconds) {
+                problems.append(problem)
+            }
+        }
+        guard ProcessReaders.KernelTaskSchedule.isDue(refresh: refresh) else { return }
+        do {
+            pendingTop = try ProcessReaders.KernelTaskSampler.start(interval: 1)
+        } catch {
+            problems.append("cannot start kernel_task reading: \(error)")
+        }
     }
 
     /// The tick's one memory read, for all three consumers (Delphi 40d78a09): the Memory column, the live status and

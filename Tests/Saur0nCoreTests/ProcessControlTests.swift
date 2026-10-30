@@ -310,6 +310,28 @@ private let own: Int32 = 1500
     #expect((try? ProcessControl.administratorCommand(signal: SIGTERM, pid: 123, ownPid: own)) == "kill -TERM 123")
 }
 
+@Test(arguments: [Int32(0), 1, own])
+func anAdministratorBatchReportsRefusedPidsWithoutRunningAPartialCommand(_ pid: Int32) {
+    let refused = row(pid, "protected")
+    let batch = ProcessControl.AdministratorBatch(signal: SIGTERM, rows: [row(123, "sleep"), refused], ownPid: own)
+    #expect(batch.command == nil)
+    let reason = ProcessControl.refusal(pid, ownPid: own)!
+    #expect(batch.error == ProcessControl.message(.refused(reason: reason), name: refused.name, pid: pid))
+}
+
+@Test func anAdministratorBatchExplainsAnEmptySelection() {
+    let batch = ProcessControl.AdministratorBatch(signal: SIGTERM, rows: [], ownPid: own)
+    #expect(batch.command == nil)
+    #expect(batch.error == "no processes remain for the administrator action")
+}
+
+@Test func anAdministratorBatchKeepsEveryAllowedCommand() {
+    let batch = ProcessControl.AdministratorBatch(signal: SIGSTOP, rows: [row(123, "sleep"), row(124, "sleep")],
+                                                  ownPid: own)
+    #expect(batch.command == "kill -STOP 123; kill -STOP 124")
+    #expect(batch.error == nil)
+}
+
 @Test func aGroupHoldingSaur0nDropsItAndSignalsTheRest() {
     // A repo group: zsh 1600 → swift-run 1601 → Saur0nApp (own) → nettop 1502; and sleep 1602 beside them.
     let rows = [row(1600, "zsh"), row(1601, "swift-run", parent: 1600), row(own, "Saur0nApp", parent: 1601),
@@ -326,6 +348,33 @@ private let own: Int32 = 1500
     let underShell = ProcessControl.select([rows[0]], rows: rows, ownPid: own)
     #expect(underShell.alsoEnds.map(\.pid) == [1601, 1602])
     #expect(underShell.left == ["Saur0n itself is left running"])
+}
+
+@Test(arguments: [ProcessControl.Action.quit, .forceQuit, .pause, .resume])
+func aShellHoldingSaur0nDoesNotReachItsHelpers(_ action: ProcessControl.Action) {
+    let rows = [row(1600, "zsh"), row(own, "Saur0nApp", parent: 1600),
+                row(1502, "nettop", parent: own), row(1503, "helper", parent: 1502),
+                row(1602, "sleep", parent: 1600)]
+    let selection = ProcessControl.select([rows[0]], rows: rows, ownPid: own)
+    #expect(selection.targets.map(\.pid) == [1600])
+    #expect(selection.alsoEnds.map(\.pid) == [1602])
+    #expect(selection.left == ["Saur0n itself is left running"])
+    let targets = selection.targets + ProcessControl.resolve(selection.alsoEnds, in: rows)
+    let recorder = Recorder()
+    _ = ProcessControl.perform(action, on: targets, current: rows.map { identity($0) }, signaller: recorder,
+                               terminator: recorder.terminator(nil), ownPid: own)
+    #expect(recorder.calls == ["\(action.signal) 1602", "\(action.signal) 1600"])
+    // Listing a tree without selecting an action still describes all its descendants.
+    #expect(ProcessControl.dependants(of: [1600], rows: rows).map(\.pid) == [own, 1502, 1503, 1602])
+}
+
+@Test func anExplicitlySelectedMonitorHelperStillReachesItsOwnChildren() {
+    let rows = [row(1600, "zsh"), row(own, "Saur0nApp", parent: 1600),
+                row(1502, "nettop", parent: own), row(1503, "helper", parent: 1502)]
+    let selection = ProcessControl.select([rows[0], rows[2]], rows: rows, ownPid: own)
+    #expect(selection.targets.map(\.pid) == [1600, 1502])
+    #expect(selection.alsoEnds.map(\.pid) == [1503])
+    #expect(selection.left == ["Saur0n itself is left running"])
 }
 
 @Test func aCatchAllHoldingKernelTaskAndLaunchdDropsBoth() {
@@ -425,6 +474,21 @@ private func spareTheSession(_ row: ProcessUsage) -> String? { row.usersOwn ? "y
     let dependants = ProcessControl.dependants(of: [20], rows: rows)
     #expect(dependants.map(\.pid) == [21, 22])
     #expect(ProcessControl.order([20, 21, 22], rows: rows).last == 20)
+}
+
+@Test func socketShapedProcessNamesKeepTheirOwnConnections() throws {
+    let listing = try SocketListing(text: """
+        listener.500,,
+        tcp4 127.0.0.1:8021<->*:*,Listen,
+        tcp4 a<->b.601,,
+        tcp4 127.0.0.1:50001<->127.0.0.1:8021,Established,
+        udp-helper a<->b.602,,
+        udp4 127.0.0.1:50002<->127.0.0.1:8021,,
+        """)
+    #expect(listing.names == [500: "listener", 601: "tcp4 a<->b", 602: "udp-helper a<->b"])
+    #expect(listing.sockets[500]?.count == 1)
+    #expect(listing.sockets[602]?.first?.proto == "udp4")
+    #expect(ProcessControl.usedBy(500, listing: listing, rows: []).map(\.pid) == [601])
 }
 
 @Test func usedByIgnoresConnectionsToOtherPorts() throws {

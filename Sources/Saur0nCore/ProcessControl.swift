@@ -148,7 +148,7 @@ public enum ProcessControl {
                 targets.append(row)
             }
         }
-        let walked = dependants(of: targets.map(\.pid), rows: rows)
+        let walked = dependants(of: targets.map(\.pid), rows: rows, stoppingAt: ownPid)
         for reason in (selected.map(\.pid) + walked.map(\.pid)).compactMap({ refusal($0, ownPid: ownPid) }) { note(reason) }
         var alsoEnds: [Dependant] = []
         for dependant in walked where refusal(dependant.pid, ownPid: ownPid) == nil {
@@ -260,6 +260,11 @@ public enum ProcessControl {
     /// Every descendant of `pids` by ppid, parents before children (siblings by pid), the targets themselves left
     /// out; a ppid loop ends the walk.
     public static func dependants(of pids: [Int32], rows: [ProcessUsage]) -> [Dependant] {
+        dependants(of: pids, rows: rows, stoppingAt: nil)
+    }
+
+    /// Selection names Saur0n as left running, but never infers its helpers as dependants of a selected ancestor.
+    private static func dependants(of pids: [Int32], rows: [ProcessUsage], stoppingAt: Int32?) -> [Dependant] {
         let byPid = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
         let childrenOf = children(rows)
         let targets = Set(pids)
@@ -267,7 +272,7 @@ public enum ProcessControl {
         func walk(_ pid: Int32) {
             for child in childrenOf[pid] ?? [] where seen.insert(child).inserted {
                 if let row = byPid[child] { out.append(dependant(row, parent: byPid[row.ppid])) }
-                walk(child)
+                if child != stoppingAt { walk(child) }
             }
         }
         for pid in pids { walk(pid) }
@@ -454,6 +459,30 @@ public enum ProcessControl {
     /// `launchctl list` now; nil when it fails.
     public static func launchctlList() -> String? {
         try? ProcessReaders.run(ProcessReaders.Command(path: "/bin/launchctl", arguments: ["list"]).start())
+    }
+
+    /// An administrator action is either a complete command or an explanation; a refused pid never disappears into
+    /// a partial command that the window could report as wholly successful.
+    public struct AdministratorBatch {
+        public let command: String?
+        public let error: String?
+
+        public init(signal: Int32, rows: [ProcessUsage],
+                    ownPid: Int32 = ProcessInfo.processInfo.processIdentifier) {
+            var commands: [String] = [], failures: [String] = []
+            for row in rows {
+                do {
+                    commands.append(try administratorCommand(signal: signal, pid: row.pid, ownPid: ownPid))
+                } catch let error as ProcessControlError {
+                    failures.append(message(error, name: row.name, pid: row.pid))
+                } catch {
+                    failures.append("\(error)")
+                }
+            }
+            if rows.isEmpty { failures.append("no processes remain for the administrator action") }
+            command = failures.isEmpty ? commands.joined(separator: "; ") : nil
+            error = failures.isEmpty ? nil : failures.joined(separator: "\n")
+        }
     }
 
     /// The command the administrator path runs as root: `kill -TERM 123` — the signal's name and the pid as an

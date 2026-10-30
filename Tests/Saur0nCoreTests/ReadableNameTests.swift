@@ -24,6 +24,22 @@ private func name(_ path: String?, _ argv: [String] = [], env: [String: String] 
     #expect(name("/w/target/debug/deps/astar-f93bb998ee1a2b3c") == "test: astar · w")
     #expect(name("/w/build/deps/astar-f93bb998ee1a2b3c") == "test: astar")
     #expect(ReadableName.of(path: "/w/target/debug/deps/astar-f93bb998ee1a2b3c", arguments: nil) == "test: astar · w")
+    #expect(name("/work/target/project/target/debug/deps/astar-f93bb998ee1a2b3c") == "test: astar · project")
+    #expect(name("/work/target/project/target/release/deps/astar-f93bb998ee1a2b3c") == "test: astar · project")
+    #expect(name("/work/target/project/target/custom/deps/astar-f93bb998ee1a2b3c") == "test: astar · project")
+    #expect(name("/work/target/project/build/other/deps/astar-f93bb998ee1a2b3c") == "test: astar")
+    #expect(name("/target/debug/deps/astar-f93bb998ee1a2b3c") == "test: astar")
+    #expect(name("/work/target/project/target/debug/deps/astar-f93bb998ee1a2b3c",
+                 env: ["CARGO_PKG_NAME": "actual-crate"]) == "test: astar · actual-crate")
+}
+
+@Test func rustCrossTargetCrateFallback() {
+    #expect(name("/work/project/target/aarch64-apple-darwin/debug/deps/astar-f93bb998ee1a2b3c") == "test: astar · project")
+    #expect(name("/work/target/project/target/aarch64-apple-darwin/release/deps/astar-f93bb998ee1a2b3c") == "test: astar · project")
+    #expect(name("/work/target/project/target/aarch64-apple-darwin/custom/deps/astar-f93bb998ee1a2b3c") == "test: astar · project")
+    #expect(name("/target/aarch64-apple-darwin/debug/deps/astar-f93bb998ee1a2b3c") == "test: astar")
+    #expect(name("/work/project/target/aarch64-apple-darwin/debug/deps/astar-f93bb998ee1a2b3c",
+                 env: ["CARGO_PKG_NAME": "actual-crate"]) == "test: astar · actual-crate")
 }
 
 @Test func rustBench() {

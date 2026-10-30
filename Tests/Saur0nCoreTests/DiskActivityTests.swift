@@ -40,6 +40,96 @@ private let second: UInt64 = 1_000_000_000
                                bytes: DiskBytes(read: 3_000, written: 1_500)))
 }
 
+@Test func rateReadingFailureKeepsDisplayButAddsNoGraphPoint() {
+    var reading = RateReading<DiskBytes, DiskUsage>()
+    var history = RateHistory()
+    for tick in 0...4 {
+        let sample = tick == 2 || tick == 3 ? nil : MachineDiskSample(
+            bytes: DiskBytes(read: UInt64(tick) * 100, written: UInt64(tick) * 200),
+            uptimeNanoseconds: UInt64(tick) * second, epochSeconds: Double(tick))
+        reading.record(sample, measure: DiskActivity.usage)
+        if let fresh = reading.tick { history.append(fresh.readBytesPerSecond, fresh.writeBytesPerSecond) }
+        if tick == 2 || tick == 3 {
+            #expect(reading.tick == nil)
+            #expect(reading.latest?.readBytesPerSecond == 100)
+            #expect(reading.window?.end == 1)
+        }
+    }
+    #expect(history.first == [100, 100])
+    #expect(history.second == [200, 200])
+    #expect(reading.latest?.readBytes == 400)
+    #expect(reading.window?.start == 1)
+    #expect(reading.window?.end == 4)
+}
+
+@Test func rateReadingFailureBeforeBaselineDoesNotInventTraffic() {
+    var reading = RateReading<NetworkBytes, NetworkUsage>()
+    reading.record(nil, measure: NetworkActivity.usage)
+    #expect(reading.latest == nil)
+    #expect(reading.tick == nil)
+    reading.record(MachineNetworkSample(bytes: NetworkBytes(received: 500, sent: 1_000),
+                                       uptimeNanoseconds: second), measure: NetworkActivity.usage)
+    #expect(reading.latest == nil)
+    #expect(reading.window == nil)
+    reading.record(nil, measure: NetworkActivity.usage)
+    reading.record(MachineNetworkSample(bytes: NetworkBytes(received: 1_100, sent: 1_300),
+                                       uptimeNanoseconds: 4 * second), measure: NetworkActivity.usage)
+    #expect(reading.tick?.rate == NetworkRate(inBytesPerSecond: 200, outBytesPerSecond: 100))
+}
+
+@Test func diskSumsSaturateWithoutWrapping() {
+    let high = DiskUsage(rate: DiskRate(readBytesPerSecond: .max - 1, writeBytesPerSecond: .max),
+                         bytes: DiskBytes(read: .max - 1, written: .max))
+    let small = DiskUsage(rate: DiskRate(readBytesPerSecond: 2, writeBytesPerSecond: 1),
+                          bytes: DiskBytes(read: 2, written: 1))
+    let sum = DiskActivity.sum([nil, high, small])
+    #expect(sum.readBytesPerSecond == .max)
+    #expect(sum.writeBytesPerSecond == .max)
+    #expect(sum.readBytes == .max)
+    #expect(sum.writeBytes == .max)
+    #expect(high.rate.totalBytesPerSecond == .max)
+    #expect(DiskActivity.unattributed(machine: DiskRate(readBytesPerSecond: 10, writeBytesPerSecond: 10),
+                                    rows: [high, small]) == .zero)
+    let drivers = [high, small].map { BlockStorageDriver(ancestorClasses: [], bytes: DiskBytes(read: $0.readBytes,
+                                                                                           written: $0.writeBytes)) }
+    #expect(DiskActivity.physical(drivers) == DiskBytes(read: .max, written: .max))
+    #expect(DiskRate(readBytesPerSecond: .max - 1, writeBytesPerSecond: 1).totalBytesPerSecond == .max)
+}
+
+private func namedDiskSample(_ counters: [(String, UInt64, UInt64)], tick: UInt64) throws -> MachineDiskSample {
+    let read = try MachineDiskReader.read(listing: {
+        counters.map { BlockStorageDriver(ancestorClasses: [], bytes: DiskBytes(read: $0.1, written: $0.2), bsdName: $0.0) }
+    })
+    var sample = MachineDiskSample(bytes: read.bytes, uptimeNanoseconds: tick * second)
+    sample.sources = read.sources
+    return sample
+}
+
+@Test func diskSourceChurnKeepsOnlyContinuingTraffic() throws {
+    let listings: [[(String, UInt64, UInt64)]] = [
+        [("disk0", 100, 200), ("disk7", 10_000, 20_000)],
+        [("disk0", 300, 600)],
+        [("disk8", 90_000, 80_000), ("disk0", 500, 1_000)],
+        [("disk0", 700, 1_400), ("disk8", 90_100, 5)],
+        [("disk9", 900_000, 800_000)],
+    ]
+    let samples = try listings.enumerated().map { try namedDiskSample($0.element, tick: UInt64($0.offset) * 2) }
+    let rates = zip(samples, samples.dropFirst()).map { DiskActivity.usage(before: $0, after: $1).rate }
+    #expect(rates == [DiskRate(readBytesPerSecond: 100, writeBytesPerSecond: 200),
+                      DiskRate(readBytesPerSecond: 100, writeBytesPerSecond: 200),
+                      DiskRate(readBytesPerSecond: 150, writeBytesPerSecond: 200), .zero])
+    #expect(DiskActivity.usage(before: samples[1], after: samples[2]).readBytes == 90_500)
+    #expect(DiskActivity.usage(before: samples[1], after: samples[1]).rate == .zero)
+}
+
+@Test func diskSourceDeltasSurviveSaturatedAggregateCounters() throws {
+    let before = try namedDiskSample([("disk0", .max - 10, 0), ("disk7", 20, 0)], tick: 0)
+    let after = try namedDiskSample([("disk7", 40, 0), ("disk0", .max, 0)], tick: 1)
+    #expect(before.bytes.read == .max)
+    #expect(after.bytes.read == .max)
+    #expect(DiskActivity.usage(before: before, after: after).readBytesPerSecond == 30)
+}
+
 // MARK: physical drivers
 
 /// The block-storage drivers of the Mac the step was built on (registry, 2026-10-21; counters made small): the
@@ -60,6 +150,19 @@ private let recordedDrivers = [
 
 @Test func onlyPhysicalDriversAreSummed() {
     #expect(DiskActivity.physical(recordedDrivers) == DiskBytes(read: 11, written: 22))
+}
+
+@Test func diskStatisticsRequireBothByteCounters() {
+    #expect(MachineDiskReader.bytes(statistics: ["Bytes (Read)": NSNumber(value: 10),
+                                                "Bytes (Write)": NSNumber(value: 20)]) == DiskBytes(read: 10, written: 20))
+    #expect(MachineDiskReader.bytes(statistics: ["Bytes (Read)": NSNumber(value: 0),
+                                                "Bytes (Write)": NSNumber(value: 0)]) == .zero)
+    #expect(MachineDiskReader.bytes(statistics: [:]) == nil)
+    #expect(MachineDiskReader.bytes(statistics: ["Bytes (Read)": NSNumber(value: 10)]) == nil)
+    #expect(MachineDiskReader.bytes(statistics: ["Bytes (Write)": NSNumber(value: 20)]) == nil)
+    #expect(MachineDiskReader.bytes(statistics: ["Bytes (Read)": "10", "Bytes (Write)": NSNumber(value: 20)]) == nil)
+    #expect(MachineDiskReader.bytes(statistics: ["Bytes (Read)": NSNumber(value: -1),
+                                                "Bytes (Write)": NSNumber(value: 20)]) == nil)
 }
 
 @Test func unreadableMachineCountersIsAnError() throws {

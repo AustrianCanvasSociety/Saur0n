@@ -352,10 +352,10 @@ public enum ProcessSample {
                 / (Double(window(survivor: survivor, before: before, after: after) { stamp($0.readAt) }) * Double(cpuCount))
         }
         let earlier = Dictionary(before.processes.map { ($0.pid, $0.startMicroseconds) }, uniquingKeysWith: { a, _ in a })
-
-        // top's %CPU is per core, so it never reads past 100 × the CPU count.
-        if let kernelTask, kernelTask.cpuPercentPerCore > 100 * Double(cpuCount) {
-            throw ProcessSampleError.unparsable(source: .top, line: "kernel_task %CPU \(kernelTask.cpuPercentPerCore)")
+        // A bad cached top reading leaves only its kernel row unread, not the whole process table.
+        let kernelTask = kernelTask.flatMap { sample in
+            sample.cpuPercentPerCore.isFinite && sample.cpuPercentPerCore >= 0
+                && sample.cpuPercentPerCore <= 100 * Double(cpuCount) ? sample : nil
         }
 
         let exited = exitedChildren(before: before, after: after, earlier: earlier)
@@ -405,6 +405,12 @@ public enum ProcessSample {
                                                                 processGroup: process.processGroup, ownUID: ownUID),
                                      terminal: process.terminal, platformBinary: process.platformBinary))
         }
+        return finish(rows, network: network, after: after, limaConfig: limaConfig)
+    }
+
+    private static func finish(_ rows: [ProcessUsage], network: [Int32: NetworkUsage]?, after: ProcessListSample,
+                               limaConfig: (String) -> String?) -> [ProcessUsage] {
+        var rows = rows
         if network != nil {
             rows = VirtualMachines.adoptLimaNetworks(rows, argv: { after.arguments[$0]?.argv }, limaConfig: limaConfig)
         }
@@ -754,6 +760,17 @@ public enum ProcessSample {
     static func roundedUInt64(_ value: Double) -> UInt64? {
         let whole = value.rounded()
         return whole.isFinite && whole >= 0 && whole < Double(UInt64.max) ? UInt64(whole) : nil
+    }
+
+    /// Elapsed uptime nanoseconds; a clock that did not advance reads 0.
+    static func elapsedNanoseconds(before: UInt64, after: UInt64) -> UInt64 {
+        after > before ? after - before : 0
+    }
+
+    /// A counter's rise per second, rounded to whole bytes; no elapsed time or no rise reads 0.
+    static func perSecond(_ then: UInt64, _ now: UInt64, nanoseconds: UInt64) -> UInt64 {
+        guard nanoseconds > 0, now > then else { return 0 }
+        return roundedUInt64(Double(now - then) * 1e9 / Double(nanoseconds)) ?? 0
     }
 
     /// The last pid-0 row of `top -l 2 -pid 0 -stats pid,cpu,mem`; top's first sample covers no window.

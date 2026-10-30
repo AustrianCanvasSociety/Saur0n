@@ -362,6 +362,24 @@ private func allLines(_ lines: [ProcessTable.Line]) -> [ProcessTable.Line] {
     #expect(schedule.latest?.cpuPercentPerCore == 10)
 }
 
+@Test func failedKernelTaskReadKeepsLastSampleAndItsAge() throws {
+    enum ReadError: Error { case failed }
+    var schedule = ProcessReaders.KernelTaskSchedule()
+    #expect(schedule.record(.failure(ReadError.failed), atNanoseconds: second) != nil)
+    #expect(schedule.latest == nil)
+    #expect(schedule.ageSeconds(atNanoseconds: second) == nil)
+    #expect(schedule.record(.success(KernelTaskSample(cpuPercentPerCore: 30, residentBytes: 1)),
+                            atNanoseconds: 2 * second) == nil)
+    let problem = schedule.record(.failure(ReadError.failed), atNanoseconds: 5 * second)
+    #expect(problem?.contains("cannot read kernel_task") == true)
+    #expect(schedule.latest?.cpuPercentPerCore == 30)
+    #expect(schedule.ageSeconds(atNanoseconds: 9 * second) == 7)
+    #expect(schedule.record(.success(KernelTaskSample(cpuPercentPerCore: 10, residentBytes: 1)),
+                            atNanoseconds: 12 * second) == nil)
+    #expect(schedule.latest?.cpuPercentPerCore == 10)
+    #expect(schedule.ageSeconds(atNanoseconds: 13 * second) == 1)
+}
+
 @Test func descriptionsReadOncePerNameAndExtendedForNewOnes() {
     var reads: [String] = []
     var sources = DescriptionSources(launchdLabels: [:], manPages: ["exampled": "/usr/share/man/man8/exampled.8",

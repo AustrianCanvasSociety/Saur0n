@@ -29,7 +29,7 @@ public struct NetworkRate: Equatable, Sendable, Encodable {
     public static let zero = NetworkRate(inBytesPerSecond: 0, outBytesPerSecond: 0)
 
     /// In plus out: what the NET column shows.
-    public var totalBytesPerSecond: UInt64 { inBytesPerSecond &+ outBytesPerSecond }
+    public var totalBytesPerSecond: UInt64 { byteSum(inBytesPerSecond, outBytesPerSecond) }
 }
 
 /// A rate over the last window and the cumulative bytes at its end: the JSON's `network` on the snapshot, each
@@ -53,29 +53,10 @@ public struct NetworkUsage: Equatable, Sendable, Encodable {
 }
 
 /// The machine's physical-interface counters at one moment, stamped as `MachineDiskSample` is.
-public struct MachineNetworkSample: Equatable, Sendable {
-    public let bytes: NetworkBytes
-    public let uptimeNanoseconds: UInt64
-    public let epochSeconds: Double
+public typealias MachineNetworkSample = MachineSample<NetworkBytes>
 
-    public init(bytes: NetworkBytes, uptimeNanoseconds: UInt64, epochSeconds: Double = 0) {
-        self.bytes = bytes
-        self.uptimeNanoseconds = uptimeNanoseconds
-        self.epochSeconds = epochSeconds
-    }
-}
-
-/// When the machine's two network reads were taken, in seconds since the epoch: the JSON's `network.windowStart`
-/// and `network.windowEnd`.
-public struct NetworkWindow: Equatable, Sendable {
-    public let start: Double
-    public let end: Double
-
-    public init(before: MachineNetworkSample, after: MachineNetworkSample) {
-        start = before.epochSeconds
-        end = after.epochSeconds
-    }
-}
+/// The JSON's `network.windowStart` and `network.windowEnd`.
+public typealias NetworkWindow = SampleWindow
 
 public enum NetworkActivityError: Error, Equatable, Sendable {
     case unreadable
@@ -95,32 +76,30 @@ public enum NetworkActivity {
     /// The bytes of every physical interface.
     public static func physical(_ interfaces: [(name: String, bytes: NetworkBytes)]) -> NetworkBytes {
         interfaces.filter { isPhysical($0.name) }
-            .reduce(NetworkBytes.zero) { NetworkBytes(received: $0.received &+ $1.bytes.received, sent: $0.sent &+ $1.bytes.sent) }
+            .reduce(NetworkBytes.zero) { NetworkBytes(received: byteSum($0.received, $1.bytes.received), sent: byteSum($0.sent, $1.bytes.sent)) }
     }
 
-    /// Bytes per second from `before` to `after` over `nanoseconds`; a counter that went backwards (an interface
-    /// gone between the reads lowers the sum), or no time elapsed, reads 0.
+    /// Bytes per second from `before` to `after` over `nanoseconds`; a counter that went backwards,
+    /// or no time elapsed, reads 0.
     public static func rate(before: NetworkBytes, after: NetworkBytes, nanoseconds: UInt64) -> NetworkRate {
-        func perSecond(_ then: UInt64, _ now: UInt64) -> UInt64 {
-            guard nanoseconds > 0, now > then else { return 0 }
-            return ProcessSample.roundedUInt64(Double(now - then) * 1e9 / Double(nanoseconds)) ?? 0
-        }
-        return NetworkRate(inBytesPerSecond: perSecond(before.received, after.received),
-                           outBytesPerSecond: perSecond(before.sent, after.sent))
+        NetworkRate(inBytesPerSecond: ProcessSample.perSecond(before.received, after.received, nanoseconds: nanoseconds),
+                    outBytesPerSecond: ProcessSample.perSecond(before.sent, after.sent, nanoseconds: nanoseconds))
     }
 
     /// The machine's rate between two reads, over their own stamps, and its counters at the second.
     public static func usage(before: MachineNetworkSample, after: MachineNetworkSample) -> NetworkUsage {
-        let elapsed = after.uptimeNanoseconds > before.uptimeNanoseconds ? after.uptimeNanoseconds - before.uptimeNanoseconds : 0
-        return NetworkUsage(rate: rate(before: before.bytes, after: after.bytes, nanoseconds: elapsed), bytes: after.bytes)
+        let elapsed = ProcessSample.elapsedNanoseconds(before: before.uptimeNanoseconds, after: after.uptimeNanoseconds)
+        let moved = NetworkBytes(received: after.delta(since: before, counter: \.received),
+                                 sent: after.delta(since: before, counter: \.sent))
+        return NetworkUsage(rate: rate(before: .zero, after: moved, nanoseconds: elapsed), bytes: after.bytes)
     }
 
     /// Rates and cumulative bytes summed over the rows that have them.
     public static func sum(_ rows: [NetworkUsage?]) -> NetworkUsage {
         rows.compactMap { $0 }.reduce(NetworkUsage.zero) { total, row in
-            NetworkUsage(rate: NetworkRate(inBytesPerSecond: total.inBytesPerSecond &+ row.inBytesPerSecond,
-                                           outBytesPerSecond: total.outBytesPerSecond &+ row.outBytesPerSecond),
-                         bytes: NetworkBytes(received: total.inBytes &+ row.inBytes, sent: total.outBytes &+ row.outBytes))
+            NetworkUsage(rate: NetworkRate(inBytesPerSecond: byteSum(total.inBytesPerSecond, row.inBytesPerSecond),
+                                           outBytesPerSecond: byteSum(total.outBytesPerSecond, row.outBytesPerSecond)),
+                         bytes: NetworkBytes(received: byteSum(total.inBytes, row.inBytes), sent: byteSum(total.outBytes, row.outBytes)))
         }
     }
 
@@ -129,7 +108,7 @@ public enum NetworkActivity {
     /// (sockets opened in the window) rates all of its bytes; a pid in `before` only is dropped, as an exited process
     /// is. A socket opened and closed between the reads leaves no trace: nettop counts open sockets only.
     public static func perProcess(before: NettopRead, after: NettopRead) -> [Int32: NetworkUsage] {
-        let nanoseconds = after.uptimeNanoseconds > before.uptimeNanoseconds ? after.uptimeNanoseconds - before.uptimeNanoseconds : 0
+        let nanoseconds = ProcessSample.elapsedNanoseconds(before: before.uptimeNanoseconds, after: after.uptimeNanoseconds)
         return after.counters.reduce(into: [:]) { out, entry in
             out[entry.key] = NetworkUsage(rate: rate(before: before.counters[entry.key] ?? .zero, after: entry.value,
                                                      nanoseconds: nanoseconds),
@@ -165,14 +144,14 @@ public enum NettopParser {
     public static func blocks(_ text: String) -> [[Int32: NetworkBytes]] {
         var out: [[Int32: NetworkBytes]] = []
         for line in text.split(whereSeparator: \.isNewline) {
-            if line.hasPrefix(",bytes_in,bytes_out") {
+            if line == ",bytes_in,bytes_out," || line == ",bytes_in,bytes_out" {
                 out.append([:])
                 continue
             }
             guard !out.isEmpty, let (column, values) = columns(line, count: 2), let (_, pid) = namePid(column),
                   let received = UInt64(values[0]), let sent = UInt64(values[1]) else { continue }
             let sum = out[out.count - 1][pid] ?? .zero
-            out[out.count - 1][pid] = NetworkBytes(received: sum.received &+ received, sent: sum.sent &+ sent)
+            out[out.count - 1][pid] = NetworkBytes(received: byteSum(sum.received, received), sent: byteSum(sum.sent, sent))
         }
         return out
     }
@@ -186,9 +165,9 @@ public enum NettopParser {
         return (fields.dropLast(count).joined(separator: ","), Array(fields.suffix(count)))
     }
 
-    /// `<name>.<pid>` → the name and the pid, the last `.`-separated field; nil without one.
+    /// `<name>.<pid>` → the name and the nonnegative pid, the last `.`-separated field; nil without one.
     static func namePid(_ column: String) -> (name: String, pid: Int32)? {
-        guard let dot = column.lastIndex(of: "."), let pid = Int32(column[column.index(after: dot)...]) else { return nil }
+        guard let dot = column.lastIndex(of: "."), let pid = Int32(column[column.index(after: dot)...]), pid >= 0 else { return nil }
         return (String(column[..<dot]), pid)
     }
 }
@@ -241,7 +220,9 @@ public struct SocketListing: Equatable, Sendable {
         var current: Int32?
         for line in text.split(whereSeparator: \.isNewline) {
             guard let (column, values) = NettopParser.columns(line, count: 1), !column.isEmpty else { continue }
-            if let space = column.firstIndex(of: " "), let arrow = column.range(of: "<->"), space < arrow.lowerBound,
+            if let space = column.firstIndex(of: " "), ["tcp4", "tcp6", "udp4", "udp6"].contains(String(column[..<space])),
+               let arrow = column.range(of: "<->"), space < arrow.lowerBound,
+               column[column.index(after: space)..<arrow.lowerBound].contains(where: { $0 == ":" || $0 == "." }),
                !column[column.index(after: space)...].contains(" ") {
                 guard let current else { continue }
                 sockets[current, default: []].append(Socket(proto: String(column[..<space]),
@@ -287,8 +268,11 @@ public enum MachineNetworkReader {
         guard let interfaces = listing(), interfaces.contains(where: { NetworkActivity.isPhysical($0.name) }) else {
             throw NetworkActivityError.unreadable
         }
-        return MachineNetworkSample(bytes: NetworkActivity.physical(interfaces), uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                                    epochSeconds: Date().timeIntervalSince1970)
+        var sample = MachineNetworkSample(bytes: NetworkActivity.physical(interfaces), uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                                          epochSeconds: Date().timeIntervalSince1970)
+        sample.sources = interfaces.filter { NetworkActivity.isPhysical($0.name) }
+            .reduce(into: [:]) { $0[$1.name] = $1.bytes }
+        return sample
     }
 
     /// Every interface's name and 64-bit byte counters, as `netstat -ib` prints them: the interface MIB

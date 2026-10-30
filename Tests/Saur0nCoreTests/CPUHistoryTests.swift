@@ -75,6 +75,62 @@ private func m5MaxLoad(performance: Double, superCores: Double) -> CPULoad {
     #expect(history.total.isEmpty)
 }
 
+@Test func historyRejectsInvalidCPUIndicesWithoutChangingPoints() throws {
+    let level = PerfLevel(index: 0, name: "Performance", logicalCPUCount: 2)
+    for cpus in [[0, 2], [-1, 1]] {
+        var history = CPUHistory(topology: CoreTopology(levels: [level], cpusByLevel: [cpus]))
+        let before = history
+        #expect(throws: CPULoadError.topologyMismatch(topologyCPUs: 2, sampledCPUs: 2)) {
+            try history.append(CPULoad(perCPU: [10, 20], total: 15))
+        }
+        #expect(history == before)
+    }
+}
+
+@Test func loadSamplerRetriesFailedTopologyAndKeepsSuccessfulTopology() throws {
+    var sampler = LoadSampler()
+    #expect(throws: TopologyError.unreadableCPUCount) {
+        try sampler.next(topology: { throw TopologyError.unreadableCPUCount }, ticks: { ticks(18) })
+    }
+    #expect(sampler.topology == nil)
+    #expect(try sampler.next(topology: { m5Max }, ticks: { ticks(18) }) == nil)
+    #expect(sampler.topology == m5Max)
+    let load = try sampler.next(topology: { throw TopologyError.registryUnreadable },
+                                ticks: { ticks(18, user: 50, idle: 50) })
+    #expect(load?.total == 50)
+}
+
+@Test func loadSamplerRetriesMismatchedCountsAndIndices() throws {
+    let smaller = CoreTopology(levels: [PerfLevel(index: 0, name: "Performance", logicalCPUCount: 2)],
+                               cpusByLevel: [[0, 1]])
+    for initial in [m5Max, CoreTopology(levels: smaller.levels, cpusByLevel: [[0, 2]])] {
+        var sampler = LoadSampler()
+        #expect(throws: CPULoadError.self) {
+            try sampler.next(topology: { initial }, ticks: { ticks(2) })
+        }
+        #expect(sampler.topology == nil)
+        #expect(try sampler.next(topology: { smaller }, ticks: { ticks(2, user: 80) }) == nil)
+        let reading = try sampler.next(topology: { smaller }, ticks: { ticks(2, user: 90, idle: 10) })
+        let load = try #require(reading)
+        #expect(load.total == 50)
+        var history = CPUHistory(topology: try #require(sampler.topology))
+        try history.append(load)
+        #expect(history.total == [50])
+    }
+}
+
+@Test func loadSamplerReopensTheWindowAfterAFailedTick() throws {
+    var sampler = LoadSampler()
+    _ = try sampler.next(topology: { m5Max }, ticks: { ticks(18) })
+    _ = try sampler.next(topology: { m5Max }, ticks: { ticks(18, user: 10) })
+    #expect(throws: TopologyError.unreadableCPUCount) {
+        try sampler.next(topology: { m5Max }, ticks: { throw TopologyError.unreadableCPUCount })
+    }
+    #expect(sampler.topology == nil)
+    #expect(try sampler.next(topology: { m5Max }, ticks: { ticks(18, user: 80) }) == nil)
+    #expect(try sampler.next(topology: { m5Max }, ticks: { ticks(18, user: 90, idle: 10) })?.total == 50)
+}
+
 @Test func samplerFirstReadGivesNoLoad() throws {
     var sampler = TickSampler()
     #expect(try sampler.next(ticks(2, user: 0, idle: 0)) == nil)

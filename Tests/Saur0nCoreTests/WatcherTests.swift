@@ -262,7 +262,7 @@ private func raisedStorm() -> (watcher: WatcherModel, tick: WarningTick, warning
     let worker = row(102, "worker", parent: wrapper.pid)
     let own = row(999, "Saur0n", parent: shell.pid)
     let service = services(1, first: 20_000)[0]
-    let rows = [shell, wrapper, worker, own, service]
+    let rows = [shell, wrapper, worker, own, service, row(103, "nettop", parent: own.pid)]
     let warning = Warning(subject: .command("example"), name: "example", since: 0, cpuPercent: 3,
                           conditions: [.copies(count: 2, growth: 2, percent: 3)], pids: [shell.pid, service.pid])
     var watcher = WatcherModel()

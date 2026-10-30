@@ -2,6 +2,12 @@
 import Foundation
 import IOKit
 
+/// Byte totals stay at the representable ceiling rather than wrapping into small readings.
+func byteSum(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+    let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? .max : sum
+}
+
 /// Bytes read and written, cumulative: since boot for the machine, since start for a process.
 public struct DiskBytes: Equatable, Sendable {
     public var read: UInt64
@@ -28,7 +34,7 @@ public struct DiskRate: Equatable, Sendable, Encodable {
     public static let zero = DiskRate(readBytesPerSecond: 0, writeBytesPerSecond: 0)
 
     /// Read plus write: what the DISK column shows.
-    public var totalBytesPerSecond: UInt64 { readBytesPerSecond &+ writeBytesPerSecond }
+    public var totalBytesPerSecond: UInt64 { byteSum(readBytesPerSecond, writeBytesPerSecond) }
 }
 
 /// A rate over the last window and the cumulative bytes at its end: the JSON's `disk` on the snapshot, each
@@ -51,41 +57,90 @@ public struct DiskUsage: Equatable, Sendable, Encodable {
     public var rate: DiskRate { DiskRate(readBytesPerSecond: readBytesPerSecond, writeBytesPerSecond: writeBytesPerSecond) }
 }
 
-/// The machine's block-storage counters at one moment, stamped in uptime nanoseconds (for the rate) and in seconds
+/// The machine's counters at one moment, stamped in uptime nanoseconds (for the rate) and in seconds
 /// since the epoch (for a check lining the window up with another tool's seconds).
-public struct MachineDiskSample: Equatable, Sendable {
-    public let bytes: DiskBytes
+public struct MachineSample<Bytes: Equatable & Sendable>: Equatable, Sendable {
+    public let bytes: Bytes
     public let uptimeNanoseconds: UInt64
     public let epochSeconds: Double
+    var sources: [String: Bytes]?
 
-    public init(bytes: DiskBytes, uptimeNanoseconds: UInt64, epochSeconds: Double = 0) {
+    public init(bytes: Bytes, uptimeNanoseconds: UInt64, epochSeconds: Double = 0) {
         self.bytes = bytes
         self.uptimeNanoseconds = uptimeNanoseconds
         self.epochSeconds = epochSeconds
     }
+
+    /// Difference each continuing source before summing; a new source or a reset adds nothing.
+    func delta(since before: Self, counter: (Bytes) -> UInt64) -> UInt64 {
+        func increase(_ old: Bytes, _ new: Bytes) -> UInt64 {
+            let start = counter(old), end = counter(new)
+            return end >= start ? end - start : 0
+        }
+        guard let old = before.sources, let current = sources else { return increase(before.bytes, bytes) }
+        return current.reduce(0) { total, entry in
+            guard let previous = old[entry.key] else { return total }
+            return byteSum(total, increase(previous, entry.value))
+        }
+    }
 }
 
-/// When the machine's two disk reads were taken, in seconds since the epoch: the JSON's `disk.windowStart` and
-/// `disk.windowEnd`.
-public struct DiskWindow: Equatable, Sendable {
+/// Keeps the last successful rate for display, but only a fresh rate feeds a graph or a tick's live status.
+/// A failed read leaves the baseline untouched, so recovery measures the whole gap once.
+public struct RateReading<Bytes: Equatable & Sendable, Usage: Sendable>: Sendable {
+    private var last: MachineSample<Bytes>?
+    public private(set) var latest: Usage?
+    public private(set) var tick: Usage?
+    public private(set) var window: SampleWindow?
+
+    public init() {}
+
+    public mutating func record(_ sample: MachineSample<Bytes>?,
+                                measure: (MachineSample<Bytes>, MachineSample<Bytes>) -> Usage) {
+        tick = nil
+        guard let sample else { return }
+        if let last {
+            let usage = measure(last, sample)
+            latest = usage
+            tick = usage
+            window = SampleWindow(before: last, after: sample)
+        }
+        last = sample
+    }
+}
+
+/// The machine's block-storage counters and their stamps.
+public typealias MachineDiskSample = MachineSample<DiskBytes>
+
+/// When the machine's two reads were taken, in seconds since the epoch.
+public struct SampleWindow: Equatable, Sendable {
     public let start: Double
     public let end: Double
 
-    public init(before: MachineDiskSample, after: MachineDiskSample) {
+    public init<Bytes>(before: MachineSample<Bytes>, after: MachineSample<Bytes>) {
         start = before.epochSeconds
         end = after.epochSeconds
     }
 }
+
+/// The JSON's `disk.windowStart` and `disk.windowEnd`.
+public typealias DiskWindow = SampleWindow
 
 /// One `IOBlockStorageDriver` as the registry lists it: the classes of every service above it, nearest first,
 /// and its `Statistics` byte counters.
 public struct BlockStorageDriver: Equatable, Sendable {
     public let ancestorClasses: [String]
     public let bytes: DiskBytes
+    let bsdName: String?
 
     public init(ancestorClasses: [String], bytes: DiskBytes) {
+        self.init(ancestorClasses: ancestorClasses, bytes: bytes, bsdName: nil)
+    }
+
+    init(ancestorClasses: [String], bytes: DiskBytes, bsdName: String?) {
         self.ancestorClasses = ancestorClasses
         self.bytes = bytes
+        self.bsdName = bsdName
     }
 }
 
@@ -103,7 +158,7 @@ public enum DiskActivity {
     /// The bytes of every driver with no disk image above it.
     public static func physical(_ drivers: [BlockStorageDriver]) -> DiskBytes {
         drivers.filter(isPhysical)
-            .reduce(DiskBytes.zero) { DiskBytes(read: $0.read &+ $1.bytes.read, written: $0.written &+ $1.bytes.written) }
+            .reduce(DiskBytes.zero) { DiskBytes(read: byteSum($0.read, $1.bytes.read), written: byteSum($0.written, $1.bytes.written)) }
     }
 
     static func isPhysical(_ driver: BlockStorageDriver) -> Bool {
@@ -113,26 +168,24 @@ public enum DiskActivity {
     /// Bytes per second from `before` to `after` over `nanoseconds`; a counter that went backwards, or no time
     /// elapsed, reads 0.
     public static func rate(before: DiskBytes, after: DiskBytes, nanoseconds: UInt64) -> DiskRate {
-        func perSecond(_ then: UInt64, _ now: UInt64) -> UInt64 {
-            guard nanoseconds > 0, now > then else { return 0 }
-            return ProcessSample.roundedUInt64(Double(now - then) * 1e9 / Double(nanoseconds)) ?? 0
-        }
-        return DiskRate(readBytesPerSecond: perSecond(before.read, after.read),
-                        writeBytesPerSecond: perSecond(before.written, after.written))
+        DiskRate(readBytesPerSecond: ProcessSample.perSecond(before.read, after.read, nanoseconds: nanoseconds),
+                 writeBytesPerSecond: ProcessSample.perSecond(before.written, after.written, nanoseconds: nanoseconds))
     }
 
     /// The machine's rate between two reads, over their own stamps, and its counters at the second.
     public static func usage(before: MachineDiskSample, after: MachineDiskSample) -> DiskUsage {
-        let elapsed = after.uptimeNanoseconds > before.uptimeNanoseconds ? after.uptimeNanoseconds - before.uptimeNanoseconds : 0
-        return DiskUsage(rate: rate(before: before.bytes, after: after.bytes, nanoseconds: elapsed), bytes: after.bytes)
+        let elapsed = ProcessSample.elapsedNanoseconds(before: before.uptimeNanoseconds, after: after.uptimeNanoseconds)
+        let moved = DiskBytes(read: after.delta(since: before, counter: \.read),
+                              written: after.delta(since: before, counter: \.written))
+        return DiskUsage(rate: rate(before: .zero, after: moved, nanoseconds: elapsed), bytes: after.bytes)
     }
 
     /// Rates and cumulative bytes summed over the rows that have them; an unreadable row adds 0.
     public static func sum(_ rows: [DiskUsage?]) -> DiskUsage {
         rows.compactMap { $0 }.reduce(DiskUsage.zero) { total, row in
-            DiskUsage(rate: DiskRate(readBytesPerSecond: total.readBytesPerSecond &+ row.readBytesPerSecond,
-                                     writeBytesPerSecond: total.writeBytesPerSecond &+ row.writeBytesPerSecond),
-                      bytes: DiskBytes(read: total.readBytes &+ row.readBytes, written: total.writeBytes &+ row.writeBytes))
+            DiskUsage(rate: DiskRate(readBytesPerSecond: byteSum(total.readBytesPerSecond, row.readBytesPerSecond),
+                                     writeBytesPerSecond: byteSum(total.writeBytesPerSecond, row.writeBytesPerSecond)),
+                      bytes: DiskBytes(read: byteSum(total.readBytes, row.readBytes), written: byteSum(total.writeBytes, row.writeBytes)))
         }
     }
 
@@ -152,12 +205,25 @@ public enum MachineDiskReader {
     /// at all, is `DiskActivityError.unreadable`.
     public static func read(listing: () -> [BlockStorageDriver]? = drivers) throws -> MachineDiskSample {
         guard let drivers = listing(), drivers.contains(where: DiskActivity.isPhysical) else { throw DiskActivityError.unreadable }
-        return MachineDiskSample(bytes: DiskActivity.physical(drivers), uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                                 epochSeconds: Date().timeIntervalSince1970)
+        let physical = drivers.filter(DiskActivity.isPhysical)
+        var sample = MachineDiskSample(bytes: DiskActivity.physical(drivers), uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                                       epochSeconds: Date().timeIntervalSince1970)
+        if physical.allSatisfy({ $0.bsdName != nil }) {
+            sample.sources = physical.reduce(into: [:]) { sources, driver in
+                if let name = driver.bsdName { sources[name] = driver.bytes }
+            }
+        }
+        return sample
+    }
+
+    static func bytes(statistics: [String: Any]) -> DiskBytes? {
+        guard let read = statistics["Bytes (Read)"] as? UInt64,
+              let written = statistics["Bytes (Write)"] as? UInt64 else { return nil }
+        return DiskBytes(read: read, written: written)
     }
 
     /// Every `IOBlockStorageDriver` with a `Statistics` dictionary, its ancestors' classes up the service plane;
-    /// nil when the registry cannot be searched.
+    /// nil when the registry cannot be searched or a driver's byte counters cannot be read.
     public static func drivers() -> [BlockStorageDriver]? {
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOBlockStorageDriver"), &iterator)
@@ -167,10 +233,15 @@ public enum MachineDiskReader {
         while case let driver = IOIteratorNext(iterator), driver != 0 {
             defer { IOObjectRelease(driver) }
             guard let raw = IORegistryEntryCreateCFProperty(driver, "Statistics" as CFString, kCFAllocatorDefault, 0)?
-                    .takeRetainedValue(), let statistics = raw as? [String: Any] else { continue }
-            func counter(_ key: String) -> UInt64 { (statistics[key] as? NSNumber)?.uint64Value ?? 0 }
-            out.append(BlockStorageDriver(ancestorClasses: ancestorClasses(driver),
-                                          bytes: DiskBytes(read: counter("Bytes (Read)"), written: counter("Bytes (Write)"))))
+                    .takeRetainedValue(), let statistics = raw as? [String: Any],
+                  let bytes = bytes(statistics: statistics) else { return nil }
+            let name = IORegistryEntrySearchCFProperty(driver, kIOServicePlane, "BSD Name" as CFString,
+                                                       kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)) as? String
+            let entry = BlockStorageDriver(ancestorClasses: ancestorClasses(driver), bytes: bytes, bsdName: name)
+            if DiskActivity.isPhysical(entry), name == nil {
+                continue // No named media is available to compare with another reading.
+            }
+            out.append(entry)
         }
         return out
     }

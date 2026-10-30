@@ -278,21 +278,18 @@ extension SystemReaders {
     }
 
     /// `tmux list-panes -a` → pane pid → session name; `[:]` when tmux is not installed, has no
-    /// server, fails, or takes over 2 seconds (the client Saur0n started is then terminated). The
-    /// output is read after exit: a few dozen bytes per pane, far inside a pipe's buffer.
+    /// server, fails, or takes over 2 seconds (the client Saur0n started is then killed). The shared
+    /// tool reader drains stdout while the client runs, so a large pane listing cannot fill the pipe.
     public static func tmuxPanes(deadline seconds: Double = 2) -> [Int32: String] {
         guard let tmux = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
             .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return [:] }
         let command = ProcessReaders.Command(path: tmux, arguments: ["list-panes", "-a", "-F", "#{pane_pid} #{session_name}"])
-        guard (try? command.start()) != nil else { return [:] }
-        guard command.exited.wait(timeout: .now() + seconds) == .success else {
-            command.process.terminate()
-            command.exited.wait()
-            return [:]
-        }
-        guard command.process.terminationStatus == 0 else { return [:] }
-        let data = command.stdout.fileHandleForReading.readDataToEndOfFile()
-        return SessionGroups.parseTmuxPanes(String(decoding: data, as: UTF8.self))
+        return tmuxPanes(command, deadline: seconds)
+    }
+
+    static func tmuxPanes(_ command: ProcessReaders.Command, deadline seconds: Double) -> [Int32: String] {
+        guard let output = try? ProcessReaders.run(command.start(), timeout: seconds) else { return [:] }
+        return SessionGroups.parseTmuxPanes(output)
     }
 
     /// The controlling terminal's name (`ttys003`) of `pid`; nil when it has none or cannot be read.

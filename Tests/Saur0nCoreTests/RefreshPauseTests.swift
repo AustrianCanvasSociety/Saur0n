@@ -24,9 +24,30 @@ private func startLoop(_ pause: RefreshPause, _ log: TickLog) -> Task<Void, Neve
     }
 }
 
-/// Waits up to 2 s for `condition`.
+/// Polls `condition` 200 times, 10 ms apart, and fails if it never becomes true.
 private func eventually(_ condition: () -> Bool) async throws {
     for _ in 0..<200 where !condition() { try await Task.sleep(for: .milliseconds(10)) }
+    try #require(condition())
+}
+
+@Test func refreshProgressCountsOnlySuccessfulProcessReadings() throws {
+    enum ReadError: Error { case failed }
+    var progress = RefreshProgress()
+    #expect(try progress.accept(Result<Int?, Error>.success(nil)) == nil)
+    #expect(progress.count == 0)
+    #expect(throws: ReadError.failed) {
+        try progress.accept(Result<Int?, Error>.failure(ReadError.failed))
+    }
+    #expect(progress.count == 0)
+    #expect(try progress.accept(Result<Int?, Error>.success(42)) == 42)
+    #expect(progress.count == 1)
+    #expect(throws: ReadError.failed) {
+        try progress.accept(Result<Int?, Error>.failure(ReadError.failed))
+    }
+    #expect(try progress.accept(Result<Int?, Error>.success(nil)) == nil)
+    #expect(progress.count == 1)
+    #expect(try progress.accept(Result<Int?, Error>.success(43)) == 43)
+    #expect(progress.count == 2)
 }
 
 @Test func runningPauseNeverHolds() async {
@@ -40,7 +61,7 @@ private func eventually(_ condition: () -> Bool) async throws {
     let log = TickLog()
     let loop = startLoop(pause, log)
     defer { loop.cancel(); pause.setPaused(false) }
-    try await Task.sleep(for: .milliseconds(200))
+    try await eventually { pause.waiterCount == 1 }
     #expect(log.all.isEmpty)
 
     pause.setPaused(false)
@@ -49,7 +70,7 @@ private func eventually(_ condition: () -> Bool) async throws {
     #expect(log.all.dropFirst().allSatisfy { !$0 })
 
     pause.setPaused(true)
-    try await Task.sleep(for: .milliseconds(50))         // a tick already past its wait may still land
+    try await eventually { pause.waiterCount == 1 }
     let frozen = log.all.count
     try await Task.sleep(for: .milliseconds(200))
     #expect(log.all.count == frozen)
@@ -90,23 +111,22 @@ private func startRefreshLoop(_ pause: RefreshPause, _ log: TickLog, seconds: Do
     #expect(Date().timeIntervalSince(start) >= 0.2)
 }
 
-@Test func refreshWhilePausedLetsOneReadingThroughAndStaysPaused() async throws {
+@Test(arguments: [0.05, 0.35])
+func refreshWhilePausedLetsOneReadingThroughAndStaysPaused(seconds: Double) async throws {
     let pause = RefreshPause()
     pause.setPaused(true)
     let log = TickLog()
-    let loop = startRefreshLoop(pause, log, seconds: 0.05)
+    let loop = startRefreshLoop(pause, log, seconds: seconds)
     defer { loop.cancel(); pause.setPaused(false) }
-    try await Task.sleep(for: .milliseconds(100))
+    try await eventually { pause.waiterCount == 1 }
     #expect(log.all.isEmpty)
     // One sample to open a window after the pause (held), one to close it a sleep later: the one reading.
     pause.refreshNow()
-    try await eventually { log.all.count >= 2 }
-    try await Task.sleep(for: .milliseconds(200))
+    try await eventually { pause.waiterCount == 1 }
     #expect(log.all == [true, false])
     // Refresh again: one more reading, the loop still paused after it.
     pause.refreshNow()
-    try await eventually { log.all.count >= 4 }
-    try await Task.sleep(for: .milliseconds(200))
+    try await eventually { pause.waiterCount == 1 }
     #expect(log.all == [true, false, true, false])
     pause.setPaused(false)
     try await eventually { log.all.count >= 6 }

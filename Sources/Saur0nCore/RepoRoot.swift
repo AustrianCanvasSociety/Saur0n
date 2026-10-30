@@ -13,6 +13,13 @@ public struct RepoInfo: Equatable, Sendable {
     public let worktree: String?
     /// The repo's `remote.origin.url` as written; nil when none. Table only (the "clone of" hint), not in JSON.
     public let origin: String?
+    /// Discovery metadata for grouping, not part of the public value or its JSON.
+    var commonGitDir: String?
+    var groupKey: String { commonGitDir ?? root }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.name == rhs.name && lhs.root == rhs.root && lhs.worktree == rhs.worktree && lhs.origin == rhs.origin
+    }
 
     public init(name: String, root: String, worktree: String?, origin: String? = nil) {
         self.name = name
@@ -43,19 +50,34 @@ public final class RepoResolver {
     private var devices: [String: UInt64?] = [:]
     private var realPaths: [String: String?] = [:]
     private let device: (String) -> UInt64?
+    private let owner: (String) -> UInt32?
+    private let ownUID = getuid()
     /// The user's home folder, realpath'd when it exists.
     private let home: String
 
     /// `device` gives a folder's filesystem; the walk does not cross from one to another
     /// (`GIT_DISCOVERY_ACROSS_FILESYSTEM` is off by default). `home` bounds `repo(forExecutable:)`.
-    public init(device: @escaping (String) -> UInt64? = RepoResolver.statDevice, home: String = NSHomeDirectory()) {
+    public convenience init(device: @escaping (String) -> UInt64? = RepoResolver.statDevice, home: String = NSHomeDirectory()) {
+        self.init(device: device, home: home, owner: Self.entryOwner)
+    }
+
+    init(device: @escaping (String) -> UInt64? = RepoResolver.statDevice, home: String = NSHomeDirectory(),
+         owner: @escaping (String) -> UInt32?) {
         self.device = device
-        var resolved = home
-        if let real = realpath(home, nil) {
-            resolved = String(cString: real)
-            free(real)
-        }
-        self.home = resolved
+        self.owner = owner
+        self.home = Self.resolveRealPath(home) ?? home
+    }
+
+    static func entryOwner(_ path: String) -> UInt32? {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        return info.st_uid
+    }
+
+    /// Reject unknown ownership too; never look past an untrusted entry to a parent repo.
+    private func trustedOwner(_ path: String) -> Bool {
+        guard let uid = owner(path) else { return false }
+        return uid == ownUID || uid == 0
     }
 
     public static func statDevice(_ path: String) -> UInt64? {
@@ -98,16 +120,21 @@ public final class RepoResolver {
         return found
     }
 
-    /// nil: no `.git` here, keep walking. `.some(nil)`: a `.git` file that leads nowhere — stop.
+    /// nil: no `.git` here, keep walking. `.some(nil)`: broken or untrusted metadata — stop.
     private func gitEntry(in folder: String) -> RepoInfo?? {
         let dotGit = Self.child(folder, ".git")
         var info = stat()
-        guard stat(dotGit, &info) == 0 else { return nil }
+        guard lstat(dotGit, &info) == 0 else { return nil }
+        guard trustedOwner(dotGit) else { return .some(nil) }
+        if info.st_mode & S_IFMT == S_IFLNK {
+            guard let target = realPath(dotGit), trustedOwner(target), stat(target, &info) == 0 else { return .some(nil) }
+        }
         switch info.st_mode & S_IFMT {
         case S_IFDIR:
             // A folder without HEAD is not a git dir (git's `is_git_directory`); look further up.
             guard Self.isRegularFile(Self.child(dotGit, "HEAD")) else { return nil }
-            return .some(RepoInfo(name: Self.basename(folder), root: folder, worktree: nil, origin: Self.origin(gitDir: dotGit)))
+            guard let gitDir = realPath(dotGit) else { return .some(nil) }
+            return .some(repoInfo(root: folder, worktree: nil, gitDir: gitDir))
         case S_IFREG:
             return .some(linked(folder, gitFile: dotGit))
         default:
@@ -120,22 +147,27 @@ public final class RepoResolver {
     private func linked(_ folder: String, gitFile: String) -> RepoInfo? {
         guard let target = Self.firstLine(gitFile), target.hasPrefix("gitdir: ") else { return nil }
         let named = String(target.dropFirst("gitdir: ".count))
-        guard let gitDir = realPath(named.hasPrefix("/") ? named : Self.child(folder, named)),
+        guard let gitDir = realPath(named.hasPrefix("/") ? named : Self.child(folder, named)), trustedOwner(gitDir),
               Self.isRegularFile(Self.child(gitDir, "HEAD")) else { return nil }
         let commonFile = Self.child(gitDir, "commondir")
         guard let common = Self.firstLine(commonFile) else {
             guard !Self.isRegularFile(commonFile) else { return nil }
-            return RepoInfo(name: Self.basename(folder), root: folder, worktree: nil, origin: Self.origin(gitDir: gitDir))
+            return repoInfo(root: folder, worktree: nil, gitDir: gitDir)
         }
-        guard let commonDir = realPath(common.hasPrefix("/") ? common : Self.child(gitDir, common)) else { return nil }
-        let origin = Self.origin(gitDir: commonDir)
+        guard let commonDir = realPath(common.hasPrefix("/") ? common : Self.child(gitDir, common)),
+              trustedOwner(commonDir) else { return nil }
         if Self.basename(commonDir) == ".git" {
-            let root = Self.parent(commonDir)
-            return RepoInfo(name: Self.basename(root), root: root, worktree: folder, origin: origin)
+            return repoInfo(root: Self.parent(commonDir), worktree: folder, gitDir: commonDir)
         }
         let bare = Self.basename(commonDir)
         let name = bare.hasSuffix(".git") && bare.count > 4 ? String(bare.dropLast(4)) : bare
-        return RepoInfo(name: name, root: commonDir, worktree: folder, origin: origin)
+        return repoInfo(root: commonDir, worktree: folder, gitDir: commonDir, name: name)
+    }
+
+    private func repoInfo(root: String, worktree: String?, gitDir: String, name: String? = nil) -> RepoInfo {
+        var repo = RepoInfo(name: name ?? Self.basename(root), root: root, worktree: worktree, origin: Self.origin(gitDir: gitDir))
+        repo.commonGitDir = gitDir
+        return repo
     }
 
     /// `remote.origin.url` from a git dir's `config`: the first `url` after the last empty value resets the list.
@@ -177,13 +209,15 @@ public final class RepoResolver {
 
     private func realPath(_ path: String) -> String? {
         if let known = realPaths[path] { return known }
-        var value: String?
-        if let resolved = realpath(path, nil) {
-            value = String(cString: resolved)
-            free(resolved)
-        }
+        let value = Self.resolveRealPath(path)
         realPaths[path] = .some(value)
         return value
+    }
+
+    private static func resolveRealPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// The first line of a small regular file, trailing whitespace dropped; nil when that line is blank.
@@ -362,14 +396,37 @@ public enum RepoGroups {
             return found
         }
 
-        var assigned: [ProcessUsage] = []
+        let assigned = withMainCheckoutRoots(rows.map { row in
+            var row = row
+            row.repo = tie(of: row).repo
+            return row
+        })
+        return (assigned, groups(assigned, workingDirectories: workingDirectories, repoOfDirectory: repoOfDirectory))
+    }
+
+    /// A separate git dir has no backlink to its main checkout. Prefer a main checkout present in
+    /// this sample, after every row has resolved, so discovery order and the resolver cache do not matter.
+    private static func withMainCheckoutRoots(_ rows: [ProcessUsage]) -> [ProcessUsage] {
+        let mains = Dictionary(rows.compactMap(\.repo).filter { $0.worktree == nil }.map { ($0.groupKey, $0) },
+                               uniquingKeysWith: { first, _ in first })
+        return rows.map { row in
+            guard let repo = row.repo, let main = mains[repo.groupKey], repo.root != main.root else { return row }
+            var row = row
+            var canonical = RepoInfo(name: main.name, root: main.root, worktree: repo.worktree, origin: repo.origin)
+            canonical.commonGitDir = repo.commonGitDir
+            row.repo = canonical
+            return row
+        }
+    }
+
+    private static func groups(_ rows: [ProcessUsage], workingDirectories: [Int32: String],
+                               repoOfDirectory: (String) -> RepoInfo?) -> [RepoGroup] {
         var members: [String: (name: String, root: String?, rows: [ProcessUsage])] = [:]
         var order: [String] = []
-        for var row in rows {
-            row.repo = tie(of: row).repo
+        for row in rows {
             let key: String, name: String
             if let repo = row.repo {
-                (key, name) = ("repo:" + repo.root, repo.name)
+                (key, name) = ("repo:" + repo.groupKey, repo.name)
             } else if row.vm != nil {
                 (key, name) = ("vms", vms)
             } else {
@@ -378,7 +435,6 @@ public enum RepoGroups {
             }
             if members[key] == nil { order.append(key) }
             members[key, default: (name, row.repo?.root, [])].rows.append(row)
-            assigned.append(row)
         }
         let repos = order.compactMap { members[$0]?.rows.first?.repo }
         let groups = order.compactMap { members[$0] }.map { member in
@@ -389,7 +445,7 @@ public enum RepoGroups {
                              residentBytes: totals.residentBytes, disk: totals.disk, network: totals.network,
                              pids: member.rows.map(\.pid))
         }
-        return (assigned, groups.sorted(by: shownBefore))
+        return groups.sorted(by: shownBefore)
     }
 
     /// The directories a `claude` command line grants with `--add-dir <directories...>` (every value up

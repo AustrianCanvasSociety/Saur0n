@@ -75,27 +75,22 @@ public struct TopMovers: Equatable, Sendable {
     /// The Memory graph's strip: the `count` largest processes now by `size` (resident memory), under their group
     /// lines' titles, as `top()` orders them; none with 0 bytes. Pass flattened lines, so sub-groups' members count.
     public static func largest(_ lines: [ProcessTable.Line], by size: (ProcessTable.Line) -> UInt64) -> [Mover] {
-        rows(lines, rate: size)
-            .filter { $0.bytes > 0 }
-            .sorted { a, b in
-                if a.bytes != b.bytes { return a.bytes > b.bytes }
-                if a.id.pid != b.id.pid { return a.id.pid < b.id.pid }
-                return a.id.startMicroseconds < b.id.startMicroseconds
-            }
-            .prefix(count)
-            .map { $0 }
+        ranked(rows(lines, rate: size).filter { $0.bytes > 0 }, bytes: \.bytes, id: \.id)
     }
 
     /// The minute's top movers: bytes descending, then pid ascending; none with 0 bytes.
     public func top() -> [Mover] {
-        sums.sorted { a, b in
-            if a.value != b.value { return a.value > b.value }
-            if a.key.pid != b.key.pid { return a.key.pid < b.key.pid }
-            return a.key.startMicroseconds < b.key.startMicroseconds
+        Self.ranked(sums, bytes: \.value, id: \.key).compactMap { id, bytes in
+            labels[id].map { Mover(id: id, name: $0.name, readableName: $0.readableName, group: $0.group, bytes: bytes) }
         }
-            .prefix(Self.count)
-            .compactMap { id, bytes in
-                labels[id].map { Mover(id: id, name: $0.name, readableName: $0.readableName, group: $0.group, bytes: bytes) }
-            }
+    }
+
+    private static func ranked<Rows: Sequence>(_ rows: Rows, bytes: (Rows.Element) -> UInt64,
+                                               id: (Rows.Element) -> ProcessTable.RowID) -> [Rows.Element] {
+        Array(rows.sorted { a, b in
+            if bytes(a) != bytes(b) { return bytes(a) > bytes(b) }
+            if id(a).pid != id(b).pid { return id(a).pid < id(b).pid }
+            return id(a).startMicroseconds < id(b).startMicroseconds
+        }.prefix(count))
     }
 }

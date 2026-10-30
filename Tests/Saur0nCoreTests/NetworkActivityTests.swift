@@ -83,6 +83,14 @@ private func reads(apart nanoseconds: UInt64) throws -> (NettopRead, NettopRead)
     #expect(NettopParser.blocks(",bytes_in,bytes_out,\nkernel_task.0,5,6,\n") == [[0: NetworkBytes(received: 5, sent: 6)]])
 }
 
+@Test func negativeNettopPidsAreSkipped() {
+    let text = ",bytes_in,bytes_out,\ninvalid.-9,10,20,\nkernel_task.0,1,2,\nvalid.9,3,4,\n"
+    #expect(NettopParser.blocks(text) == [[0: NetworkBytes(received: 1, sent: 2),
+                                           9: NetworkBytes(received: 3, sent: 4)]])
+    #expect(NettopParser.namePid("invalid.-9") == nil)
+    #expect(NettopParser.namePid("invalid.2147483648") == nil)
+}
+
 @Test func malformedRowsAreSkipped() {
     let text = ",bytes_in,bytes_out,\nfoo,1,2,\nbar.12,x,y,\nbaz.13,3,4,\n"
     #expect(NettopParser.blocks(text) == [[13: NetworkBytes(received: 3, sent: 4)]])
@@ -96,6 +104,13 @@ private func reads(apart nanoseconds: UInt64) throws -> (NettopRead, NettopRead)
                                             6: NetworkBytes(received: 50, sent: 60)]])
 }
 
+@Test func headerPrefixInAProcessNameDoesNotStartABlock() {
+    let text = ",bytes_in,bytes_out,\nfoo.9,1,2,\n,bytes_in,bytes_out-helper.10,3,4,\n,bytes_in,bytes_out,\nfoo.9,5,6,\n"
+    #expect(NettopParser.blocks(text) == [[9: NetworkBytes(received: 1, sent: 2),
+                                          10: NetworkBytes(received: 3, sent: 4)],
+                                         [9: NetworkBytes(received: 5, sent: 6)]])
+}
+
 @Test func pidListedTwiceInABlockSums() {
     let text = ",bytes_in,bytes_out,\nfoo.9,1,2,\nfoo-helper.9,10,20,\n"
     #expect(NettopParser.blocks(text) == [[9: NetworkBytes(received: 11, sent: 22)]])
@@ -104,6 +119,25 @@ private func reads(apart nanoseconds: UInt64) throws -> (NettopRead, NettopRead)
 @Test func readWithoutABlockIsAnError() {
     #expect(throws: NetworkActivityError.unreadable) { try NettopRead(text: "", uptimeNanoseconds: second) }
     #expect(throws: NetworkActivityError.unreadable) { try NettopRead(text: "kernel_task.0,5,6,\n", uptimeNanoseconds: second) }
+}
+
+@Test func networkSumsSaturateWithoutWrapping() {
+    let high = NetworkUsage(rate: NetworkRate(inBytesPerSecond: .max - 1, outBytesPerSecond: .max),
+                            bytes: NetworkBytes(received: .max - 1, sent: .max))
+    let small = NetworkUsage(rate: NetworkRate(inBytesPerSecond: 2, outBytesPerSecond: 1),
+                             bytes: NetworkBytes(received: 2, sent: 1))
+    let sum = NetworkActivity.sum([nil, high, small])
+    #expect(sum.inBytesPerSecond == .max)
+    #expect(sum.outBytesPerSecond == .max)
+    #expect(sum.inBytes == .max)
+    #expect(sum.outBytes == .max)
+    #expect(high.rate.totalBytesPerSecond == .max)
+    #expect(NetworkActivity.physical([("en0", NetworkBytes(received: .max - 1, sent: .max)),
+                                      ("en7", NetworkBytes(received: 2, sent: 1))])
+                == NetworkBytes(received: .max, sent: .max))
+    let text = ",bytes_in,bytes_out,\nfoo.9,\(UInt64.max - 1),\(UInt64.max),\nfoo.9,2,1,\n"
+    #expect(NettopParser.blocks(text) == [[9: NetworkBytes(received: .max, sent: .max)]])
+    #expect(NetworkRate(inBytesPerSecond: .max - 1, outBytesPerSecond: 1).totalBytesPerSecond == .max)
 }
 
 // MARK: machine
@@ -118,12 +152,38 @@ private func reads(apart nanoseconds: UInt64) throws -> (NettopRead, NettopRead)
     #expect(NetworkActivity.physical(interfaces) == bytes(101, 201))
 }
 
-@Test func interfaceGoneBetweenReadsDoesNotGoNegative() {
-    let before = NetworkActivity.physical([("en0", NetworkBytes(received: 1_000, sent: 1_000)),
-                                           ("en7", NetworkBytes(received: 500, sent: 500))])
-    let after = NetworkActivity.physical([("en0", NetworkBytes(received: 1_200, sent: 1_600))])
-    #expect(NetworkActivity.rate(before: before, after: after, nanoseconds: second)
-                == NetworkRate(inBytesPerSecond: 0, outBytesPerSecond: 100))
+private func namedNetworkSample(_ counters: [(String, UInt64, UInt64)], tick: UInt64) throws -> MachineNetworkSample {
+    let read = try MachineNetworkReader.read(listing: {
+        counters.map { (name: $0.0, bytes: NetworkBytes(received: $0.1, sent: $0.2)) }
+    })
+    var sample = MachineNetworkSample(bytes: read.bytes, uptimeNanoseconds: tick * second)
+    sample.sources = read.sources
+    return sample
+}
+
+@Test func networkSourceChurnKeepsOnlyContinuingTraffic() throws {
+    let listings: [[(String, UInt64, UInt64)]] = [
+        [("en0", 100, 200), ("en7", 10_000, 20_000)],
+        [("en0", 300, 600)],
+        [("en8", 90_000, 80_000), ("en0", 500, 1_000)],
+        [("en0", 700, 1_400), ("en8", 90_100, 5)],
+        [("en9", 900_000, 800_000)],
+    ]
+    let samples = try listings.enumerated().map { try namedNetworkSample($0.element, tick: UInt64($0.offset) * 2) }
+    let rates = zip(samples, samples.dropFirst()).map { NetworkActivity.usage(before: $0, after: $1).rate }
+    #expect(rates == [NetworkRate(inBytesPerSecond: 100, outBytesPerSecond: 200),
+                      NetworkRate(inBytesPerSecond: 100, outBytesPerSecond: 200),
+                      NetworkRate(inBytesPerSecond: 150, outBytesPerSecond: 200), .zero])
+    #expect(NetworkActivity.usage(before: samples[1], after: samples[2]).inBytes == 90_500)
+    #expect(NetworkActivity.usage(before: samples[1], after: samples[1]).rate == .zero)
+}
+
+@Test func networkSourceDeltasSurviveSaturatedAggregateCounters() throws {
+    let before = try namedNetworkSample([("en0", .max - 10, 0), ("en7", 20, 0)], tick: 0)
+    let after = try namedNetworkSample([("en7", 40, 0), ("en0", .max, 0)], tick: 1)
+    #expect(before.bytes.received == .max)
+    #expect(after.bytes.received == .max)
+    #expect(NetworkActivity.usage(before: before, after: after).inBytesPerSecond == 30)
 }
 
 @Test func zeroElapsedReadsZero() {

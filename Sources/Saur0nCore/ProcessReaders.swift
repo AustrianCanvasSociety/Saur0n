@@ -12,8 +12,7 @@ public enum ProcessReadError: Error, Equatable, Sendable {
     /// `stderr`: the end of what the tool printed there, so the failure says why.
     case command(path: String, status: Int32, stderr: String)
     case timebase(kernReturn: Int32)
-    /// The tool had not finished `seconds` after its read began: it was killed, or it had exited while a child of it
-    /// still held its stdout open.
+    /// The tool had not finished `seconds` after its read began; it was sent SIGKILL.
     case timedOut(path: String, seconds: Double)
 }
 
@@ -312,6 +311,18 @@ public enum ProcessReaders {
             readAtNanoseconds = uptime
         }
 
+        /// A failed tool read reports its problem without replacing the last sample or resetting its age.
+        @discardableResult
+        public mutating func record(_ result: Result<KernelTaskSample, Error>, atNanoseconds uptime: UInt64) -> String? {
+            switch result {
+            case .success(let sample):
+                record(sample, atNanoseconds: uptime)
+                return nil
+            case .failure(let error):
+                return "cannot read kernel_task: \(error)"
+            }
+        }
+
         /// Whole seconds since the last reading at uptime `now`; nil before the first.
         public func ageSeconds(atNanoseconds now: UInt64) -> Int? {
             readAtNanoseconds.map { Int((now >= $0 ? now - $0 : 0) / 1_000_000_000) }
@@ -372,11 +383,13 @@ public enum ProcessReaders {
     /// by the pid it was started with and `ProcessReadError.timedOut` is thrown.
     static func run(_ command: Command, timeout: Double = timeout) throws -> String {
         let deadline = DispatchTime.now() + timeout
-        // Stdout still open at the deadline (the tool hung, or a child of it holds stdout) is a timeout.
-        guard let data = readToEnd(command.stdout.fileHandleForReading.fileDescriptor, until: deadline),
-              command.exited.wait(timeout: deadline) == .success else {
+        defer { try? command.stdout.fileHandleForReading.close() }
+        guard let data = readToEnd(command.stdout.fileHandleForReading.fileDescriptor, until: deadline,
+                                  finished: { !command.process.isRunning }),
+              command.exited.wait(timeout: deadline) == .success || !command.process.isRunning else {
             if command.process.isRunning { kill(command.process.processIdentifier, SIGKILL) }
-            command.exited.wait()
+            // Reaping must not turn a bounded tool read into an unbounded wait for its notification.
+            _ = command.exited.wait(timeout: .now() + 0.1)
             throw ProcessReadError.timedOut(path: command.process.executableURL?.path ?? "?", seconds: timeout)
         }
         guard command.process.terminationStatus == 0 else {
@@ -386,19 +399,21 @@ public enum ProcessReaders {
         return String(decoding: data, as: UTF8.self)
     }
 
-    /// Everything on `fd` up to its end, read on the calling thread so the deadline holds while the tool writes; nil
-    /// when the end has not come by `deadline` or the pipe could not be read (never half the output taken for all of
-    /// it). Not on a pool thread: with every one of this process's worker threads
-    /// busy, Dispatch starts no new one, and a read queued there began only when they finished, seconds past the
-    /// deadline of a tool that had exited at once (flake, 2026-10-26).
-    static func readToEnd(_ fd: Int32, until deadline: DispatchTime) -> Data? {
+    /// Read on the calling thread: a pool task can starve behind busy workers (flake, 2026-10-26).
+    /// Once the tool exits, drain only the bytes already queued: a descendant holding stdout cannot delay it
+    /// or keep extending the read. A still-running tool at the deadline, or an unreadable pipe, returns nil.
+    static func readToEnd(_ fd: Int32, until deadline: DispatchTime, finished: () -> Bool) -> Data? {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 1 << 16)
         var ready = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
         while true {
+            if finished() { return queuedOutput(fd, appendingTo: data, buffer: &buffer) }
             let now = DispatchTime.now().uptimeNanoseconds
-            guard now < deadline.uptimeNanoseconds else { return nil }
-            let milliseconds = Int32(min((deadline.uptimeNanoseconds - now + 999_999) / 1_000_000, UInt64(Int32.max)))
+            guard now < deadline.uptimeNanoseconds else {
+                return finished() ? queuedOutput(fd, appendingTo: data, buffer: &buffer) : nil
+            }
+            // Check for exit even when a descendant keeps the pipe open without writing.
+            let milliseconds = Int32(min((deadline.uptimeNanoseconds - now + 999_999) / 1_000_000, 20))
             let polled = poll(&ready, 1, milliseconds)
             if polled < 0 && errno != EINTR { return nil }
             guard polled > 0 else { continue }
@@ -410,5 +425,22 @@ public enum ProcessReaders {
                 return nil
             }
         }
+    }
+
+    private static func queuedOutput(_ fd: Int32, appendingTo initial: Data, buffer: inout [UInt8]) -> Data? {
+        var remaining: Int32 = 0
+        // FIONREAD = _IOR('f', 127, int) in sys/filio.h; Swift cannot import its sizeof-based macro.
+        guard ioctl(fd, 0x4004667f, &remaining) == 0, remaining >= 0 else { return nil }
+        var data = initial
+        while remaining > 0 {
+            let count = read(fd, &buffer, min(Int(remaining), buffer.count))
+            if count > 0 {
+                data.append(contentsOf: buffer[..<count])
+                remaining -= Int32(count)
+            } else if count == 0 || errno != EINTR {
+                return nil
+            }
+        }
+        return data
     }
 }

@@ -70,6 +70,81 @@ private func relativePath(from: String, to: String) -> String {
     }
 }
 
+@Test func separateGitDirGroupsWithItsMainCheckoutInEitherOrder() throws {
+    try withTree { t in
+        for store in [t + "/store", t + "/vault/.git"] {
+            let main = t + "/checkout"
+            try write(store + "/HEAD", "ref: refs/heads/main\n")
+            try write(store + "/config", "[remote \"origin\"]\nurl = https://git.example/o/r.git\n")
+            try write(main + "/.git", "gitdir: \(relativePath(from: main, to: store))\n")
+            try linkedWorktree(t + "/linked", common: store, relative: true)
+            try linkedWorktree(t + "/second", common: store)
+            try write(store + "/worktrees/second/commondir", store + "\n")
+            try mkdir(main + "/src")
+            for pids: [Int32] in [[10, 11, 12], [12, 11, 10]] {
+                let resolver = RepoResolver()
+                let result = RepoGroups.assign(pids.map(repoRow),
+                                               workingDirectories: [10: main + "/src", 11: t + "/linked", 12: t + "/second"],
+                                               repoOfDirectory: resolver.repo(forDirectory:), repoOfExecutable: { _ in nil })
+                #expect(result.groups.count == 1)
+                #expect(result.groups.first?.root == main)
+                #expect(result.groups.first?.name == "checkout")
+                #expect(result.groups.first?.pids == pids)
+                #expect(result.groups.first?.cpuPercent == 3)
+                #expect(result.rows.allSatisfy { $0.repo?.root == main && $0.repo?.name == "checkout" })
+                #expect(result.rows.allSatisfy { $0.repo?.origin == "https://git.example/o/r.git" })
+                #expect(result.rows.first { $0.pid == 10 }?.repo?.worktree == nil)
+                #expect(result.rows.first { $0.pid == 11 }?.repo?.worktree == t + "/linked")
+                #expect(result.rows.first { $0.pid == 12 }?.repo?.worktree == t + "/second")
+                let json = String(decoding: try JSONEncoder().encode(result.rows.compactMap(\.repo)), as: UTF8.self)
+                #expect(!json.contains("commonGitDir"))
+            }
+        }
+    }
+}
+
+@Test func separateGitDirWithoutAnObservedMainCheckoutUsesTheGitDir() throws {
+    try withTree { t in
+        try write(t + "/store/HEAD", "ref: refs/heads/main\n")
+        try write(t + "/checkout/.git", "gitdir: \(t)/store\n")
+        try linkedWorktree(t + "/linked", common: t + "/store")
+        try linkedWorktree(t + "/second", common: t + "/store")
+        let resolver = RepoResolver()
+        let linkedOnly = RepoGroups.assign([repoRow(11), repoRow(12)],
+                                           workingDirectories: [11: t + "/linked", 12: t + "/second"],
+                                           repoOfDirectory: resolver.repo(forDirectory:), repoOfExecutable: { _ in nil })
+        #expect(linkedOnly.groups.count == 1)
+        #expect(linkedOnly.groups.first?.root == t + "/store")
+        #expect(linkedOnly.groups.first?.name == "store")
+        let withMain = RepoGroups.assign([repoRow(11), repoRow(10)],
+                                         workingDirectories: [10: t + "/checkout", 11: t + "/linked"],
+                                         repoOfDirectory: resolver.repo(forDirectory:), repoOfExecutable: { _ in nil })
+        #expect(withMain.groups.count == 1)
+        #expect(withMain.groups.first?.root == t + "/checkout")
+        let afterMainLeaves = RepoGroups.assign([repoRow(11)], workingDirectories: [11: t + "/linked"],
+                                               repoOfDirectory: resolver.repo(forDirectory:), repoOfExecutable: { _ in nil })
+        #expect(afterMainLeaves.groups.first?.root == t + "/store")
+    }
+}
+
+@Test func separateGitDirsWithTheSameNameStaySeparate() throws {
+    try withTree { t in
+        for name in ["one", "two"] {
+            try write(t + "/\(name)/store/HEAD", "ref: refs/heads/main\n")
+            try write(t + "/\(name)/checkout/.git", "gitdir: \(t)/\(name)/store\n")
+            try linkedWorktree(t + "/\(name)/linked", common: t + "/\(name)/store")
+        }
+        let resolver = RepoResolver()
+        let result = RepoGroups.assign([repoRow(10), repoRow(11), repoRow(12), repoRow(13)],
+                                       workingDirectories: [10: t + "/one/checkout", 11: t + "/one/linked",
+                                                            12: t + "/two/checkout", 13: t + "/two/linked"],
+                                       repoOfDirectory: resolver.repo(forDirectory:), repoOfExecutable: { _ in nil })
+        #expect(result.groups.count == 2)
+        #expect(Set(result.groups.compactMap(\.root)) == [t + "/one/checkout", t + "/two/checkout"])
+        #expect(result.groups.allSatisfy { $0.pids.count == 2 })
+    }
+}
+
 @Test func submoduleIsItsOwnRepo() throws {
     try withTree { t in
         try checkout(t + "/r")
@@ -142,6 +217,114 @@ private func relativePath(from: String, to: String) -> String {
     }
 }
 
+@Test func realPathsCacheResolvedAndMissingFolders() throws {
+    try withTree { t in
+        try checkout(t + "/first")
+        try checkout(t + "/second")
+        let link = t + "/link"
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: t + "/first")
+        let resolver = RepoResolver()
+        #expect(resolver.repo(forDirectory: link)?.root == t + "/first")
+        #expect(resolver.repo(forDirectory: t + "/missing") == nil)
+        try FileManager.default.removeItem(atPath: link)
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: t + "/second")
+        try checkout(t + "/missing")
+        #expect(resolver.repo(forDirectory: link)?.root == t + "/first")
+        #expect(resolver.repo(forDirectory: t + "/missing") == nil)
+        #expect(RepoResolver().repo(forDirectory: link)?.root == t + "/second")
+        #expect(RepoResolver().repo(forDirectory: t + "/missing")?.root == t + "/missing")
+    }
+}
+
+@Test func untrustedGitEntryStopsBeforeAnOuterRepo() throws {
+    try withTree { t in
+        try checkout(t + "/outer")
+        try checkout(t + "/outer/directory")
+        try mkdir(t + "/outer/empty/.git")
+        try write(t + "/store/HEAD", "ref: refs/heads/main\n")
+        try write(t + "/outer/file/.git", "gitdir: \(t)/store\n")
+        try mkdir(t + "/outer/link")
+        try FileManager.default.createSymbolicLink(atPath: t + "/outer/link/.git", withDestinationPath: t + "/store")
+        for name in ["directory", "empty", "file", "link"] {
+            let folder = t + "/outer/" + name
+            try mkdir(folder + "/deep")
+            for rejectedOwner: UInt32? in [UInt32.max, nil] {
+                let resolver = RepoResolver(owner: { $0 == folder + "/.git" ? rejectedOwner : getuid() })
+                #expect(resolver.repo(forDirectory: t + "/outer")?.root == t + "/outer")
+                #expect(resolver.repo(forDirectory: folder + "/deep") == nil)
+                #expect(resolver.repo(forDirectory: folder) == nil)
+            }
+        }
+    }
+}
+
+@Test func untrustedResolvedGitDirStopsBeforeAnOuterRepo() throws {
+    try withTree { t in
+        try checkout(t + "/outer")
+        try write(t + "/store/HEAD", "ref: refs/heads/main\n")
+        try FileManager.default.createSymbolicLink(atPath: t + "/alias", withDestinationPath: t + "/store")
+        try write(t + "/outer/file/.git", "gitdir: ../../alias\n")
+        try mkdir(t + "/outer/link")
+        try FileManager.default.createSymbolicLink(atPath: t + "/outer/link/.git", withDestinationPath: t + "/store")
+        for name in ["file", "link"] {
+            for rejectedOwner: UInt32? in [UInt32.max, nil] {
+                let resolver = RepoResolver(owner: { $0 == t + "/store" ? rejectedOwner : getuid() })
+                #expect(resolver.repo(forDirectory: t + "/outer/" + name) == nil)
+            }
+        }
+    }
+}
+
+@Test func untrustedCommonGitDirIsRejected() throws {
+    try withTree { t in
+        try checkout(t + "/outer")
+        try checkout(t + "/r")
+        try linkedWorktree(t + "/outer/linked", common: t + "/r/.git")
+        for rejected in [t + "/r/.git", t + "/r/.git/worktrees/linked"] {
+            for rejectedOwner: UInt32? in [UInt32.max, nil] {
+                let resolver = RepoResolver(owner: { $0 == rejected ? rejectedOwner : getuid() })
+                #expect(resolver.repo(forDirectory: t + "/outer/linked") == nil)
+            }
+        }
+    }
+}
+
+@Test func trustedGitOwnersIncludeCurrentUserAndRoot() throws {
+    try withTree { t in
+        try checkout(t + "/r")
+        try linkedWorktree(t + "/linked", common: t + "/r/.git")
+        try write(t + "/store/HEAD", "ref: refs/heads/main\n")
+        try write(t + "/separate/.git", "gitdir: \(t)/store\n")
+        #expect(RepoResolver.entryOwner(t + "/r/.git") == getuid())
+        #expect(RepoResolver.entryOwner(t + "/missing") == nil)
+        for uid in [getuid(), 0] {
+            let resolver = RepoResolver(owner: { _ in uid })
+            #expect(resolver.repo(forDirectory: t + "/r")?.root == t + "/r")
+            #expect(resolver.repo(forDirectory: t + "/linked")?.root == t + "/r")
+            #expect(resolver.repo(forDirectory: t + "/separate")?.root == t + "/separate")
+        }
+    }
+}
+
+@Test func gitOwnerChecksAreCachedWithTheWalk() throws {
+    try withTree { t in
+        try checkout(t + "/r")
+        try mkdir(t + "/r/a")
+        try mkdir(t + "/r/b")
+        var checked: [String] = []
+        let resolver = RepoResolver(owner: { checked.append($0); return getuid() })
+        #expect(resolver.repo(forDirectory: t + "/r/a")?.root == t + "/r")
+        #expect(resolver.repo(forDirectory: t + "/r/b")?.root == t + "/r")
+        #expect(resolver.repo(forDirectory: t + "/r")?.root == t + "/r")
+        #expect(checked == [t + "/r/.git"])
+        var deniedChecks = 0
+        let denied = RepoResolver(owner: { _ in deniedChecks += 1; return UInt32.max })
+        #expect(denied.repo(forDirectory: t + "/r/a") == nil)
+        #expect(denied.repo(forDirectory: t + "/r/b") == nil)
+        #expect(deniedChecks == 1)
+    }
+}
+
 @Test func walksAreCachedPositiveAndNegative() throws {
     try withTree { t in
         try checkout(t + "/r")
@@ -182,6 +365,20 @@ private func relativePath(from: String, to: String) -> String {
         let resolver = RepoResolver(home: t + "/fixtures")
         #expect(resolver.repo(forExecutable: t + "/fixtures/r/.build/debug/tool")?.name == "r")
         #expect(resolver.repo(forExecutable: "/bin/ls") == nil)
+    }
+}
+
+@Test func executableHomeResolvesSymlinksAndKeepsMissingPaths() throws {
+    try withTree { t in
+        try checkout(t + "/fixtures/r")
+        try write(t + "/fixtures/r/bin/tool", "")
+        try FileManager.default.createSymbolicLink(atPath: t + "/alias", withDestinationPath: t + "/fixtures")
+        let linkedHome = RepoResolver(home: t + "/alias")
+        #expect(linkedHome.repo(forExecutable: t + "/fixtures/r/bin/tool")?.root == t + "/fixtures/r")
+        let missingHome = RepoResolver(home: t + "/later")
+        try checkout(t + "/later/r")
+        try write(t + "/later/r/bin/tool", "")
+        #expect(missingHome.repo(forExecutable: t + "/later/r/bin/tool")?.root == t + "/later/r")
     }
 }
 

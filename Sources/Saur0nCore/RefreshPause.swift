@@ -22,6 +22,9 @@ public final class RefreshPause: Sendable {
 
     public init() {}
 
+    /// Lets tests wait until the loop has parked rather than guess how long it takes.
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
+
     /// Pauses or resumes; resuming releases every waiting loop.
     public func setPaused(_ paused: Bool) {
         let released = state.withLock { state in
@@ -101,6 +104,19 @@ public final class RefreshPause: Sendable {
             return sleeper.waiter
         }
         sleeper?.resume()
+    }
+}
+
+/// Counts applied process readings, not attempts: a failed scan or an opening sample has no new rows to show.
+public struct RefreshProgress: Sendable {
+    public private(set) var count = 0
+
+    public init() {}
+
+    public mutating func accept<Value>(_ reading: Result<Value?, Error>) throws -> Value? {
+        guard let value = try reading.get() else { return nil }
+        count += 1
+        return value
     }
 }
 

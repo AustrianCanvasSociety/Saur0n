@@ -28,6 +28,15 @@ private func sample(at uptime: UInt64, _ processes: [ProcessIdentity],
 
 // MARK: share math and lifecycle
 
+@Test func elapsedNanosecondsFloorsNonAdvancingClocks() {
+    #expect(ProcessSample.elapsedNanoseconds(before: 10, after: 25) == 15)
+    #expect(ProcessSample.elapsedNanoseconds(before: 0, after: 0) == 0)
+    #expect(ProcessSample.elapsedNanoseconds(before: 10, after: 10) == 0)
+    #expect(ProcessSample.elapsedNanoseconds(before: 25, after: 10) == 0)
+    #expect(ProcessSample.elapsedNanoseconds(before: .max, after: 0) == 0)
+    #expect(ProcessSample.elapsedNanoseconds(before: 0, after: .max) == .max)
+}
+
 @Test func shareOverCPUCount() throws {
     let before = sample(at: 10 * second, [identity(42)], taskInfo: [42: counters(5 * second)])
     let after = sample(at: 11 * second, [identity(42)], taskInfo: [42: counters(7 * second)])
@@ -416,28 +425,123 @@ private func usage(_ pid: Int32, _ rows: [ProcessUsage]) throws -> ProcessUsage 
     #expect(ProcessReaders.timeout == 5)
 }
 
-/// A quick tool is read within its deadline while every one of this process's worker threads is busy: the suite's heavy
-/// tests did that for 8 s, and stdout read on a pool thread waited for one to come free, past the deadline (flake,
-/// 2026-10-26). The test calls the runner from a thread outside the pool, so the pool is left wholly to the busy workers.
+@Test func exitedCommandDoesNotWaitForAnotherStdoutWriter() throws {
+    let command = ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "echo fine"])
+    let holder = Process()
+    holder.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    holder.arguments = ["30"]
+    holder.standardOutput = FileHandle(fileDescriptor: dup(command.stdout.fileHandleForWriting.fileDescriptor), closeOnDealloc: true)
+    try holder.run()
+    defer {
+        if holder.isRunning { kill(holder.processIdentifier, SIGKILL) }
+        holder.waitUntilExit()
+    }
+    let started = try command.start()
+    #expect(try ProcessReaders.run(started, timeout: 0.2) == "fine\n")
+    #expect(holder.isRunning)
+}
+
+@Test func completedCommandAtItsDeadlineKeepsAllOutput() throws {
+    let command = try ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "echo fine"]).start()
+    command.process.waitUntilExit()
+    #expect(try ProcessReaders.run(command, timeout: 0) == "fine\n")
+}
+
+@Test func killedCommandDoesNotWaitForeverForAnExitNotification() throws {
+    let command = ProcessReaders.Command(path: "/bin/sleep", arguments: ["30"])
+    command.process.terminationHandler = nil
+    let started = try command.start()
+    let exited = command.exited
+    let finished = DispatchSemaphore(value: 0)
+    // Release the old unbounded wait if the regression returns, without relying on the pool's workers.
+    Thread.detachNewThread {
+        if finished.wait(timeout: .now() + 2) == .timedOut { exited.signal() }
+    }
+    defer { finished.signal() }
+    let began = DispatchTime.now().uptimeNanoseconds
+    #expect(throws: ProcessReadError.timedOut(path: "/bin/sleep", seconds: 0.1)) {
+        try ProcessReaders.run(started, timeout: 0.1)
+    }
+    #expect(DispatchTime.now().uptimeNanoseconds - began < 1_500_000_000)
+    #expect(!command.process.isRunning)
+}
+
+private final class BlockedPoolWorkers: @unchecked Sendable {
+    let started = DispatchGroup()
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let count: Int
+    private var released = false
+    private var holding = 0
+
+    init(count: Int) {
+        self.count = count
+        for _ in 0 ..< count { started.enter() }
+    }
+
+    func hold() {
+        lock.lock()
+        holding += 1
+        started.leave()
+        lock.unlock()
+        // Each worker bounds its own wait; a queued fallback can itself starve behind the held workers.
+        _ = gate.wait(timeout: .now() + 30)
+        lock.lock()
+        holding -= 1
+        lock.unlock()
+    }
+
+    var heldCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return released ? 0 : holding
+    }
+
+    func release() {
+        lock.lock()
+        guard !released else { lock.unlock(); return }
+        released = true
+        lock.unlock()
+        for _ in 0 ..< count { gate.signal() }
+    }
+}
+
+/// A pool-task stdout read must wait for held workers; a dedicated-thread read must not. Prepare output before
+/// holding one worker per core, then release them only after the read. Allow 20 s for the shared pool to start
+/// workers; their own 30 s bounds leave room for the 3 s read without burning CPU or timing success by a cutoff.
 @Test func commandIsReadWhileEveryWorkerThreadIsBusy() async throws {
-    let busyUntil = Date().addingTimeInterval(1.5)
-    let workers = (0 ..< ProcessInfo.processInfo.activeProcessorCount).map { _ in
-        Task.detached(priority: .medium) {
-            var x: UInt64 = 1
-            while Date() < busyUntil { for _ in 0 ..< 10_000 { x = x &* 6364136223846793005 &+ 1 } }
-            return x
-        }
-    }
-    let result: Result<String, Error> = await withCheckedContinuation { done in
+    let count = ProcessInfo.processInfo.activeProcessorCount
+    let reading: (output: Result<String, Error>, held: Int, started: Bool,
+                  workers: [Task<Void, Never>]) = await withCheckedContinuation { done in
         Thread.detachNewThread {
-            Thread.sleep(forTimeInterval: 0.1)    // the workers are running
-            done.resume(returning: Result {
-                try ProcessReaders.run(ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "echo fine"]).start(), timeout: 0.5)
-            })
+            let command: ProcessReaders.Command
+            do {
+                command = try ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "echo fine"]).start()
+                command.process.waitUntilExit()
+            } catch {
+                done.resume(returning: (.failure(error), 0, true, []))
+                return
+            }
+            let held = BlockedPoolWorkers(count: count)
+            let workers = (0 ..< count).map { _ in
+                Task.detached(priority: .medium) { held.hold() }
+            }
+            guard held.started.wait(timeout: .now() + 20) == .success else {
+                held.release()
+                done.resume(returning: (.success(""), 0, false, workers))
+                return
+            }
+            let output = Result { try ProcessReaders.run(command, timeout: 3) }
+            // Inspect here: resuming the test itself needs a pool worker, which release frees.
+            let stillHeld = held.heldCount
+            held.release()
+            done.resume(returning: (output, stillHeld, true, workers))
         }
     }
-    for worker in workers { _ = await worker.value }
-    #expect(try result.get() == "fine\n")
+    for worker in reading.workers { await worker.value }
+    try #require(reading.started, "Busy-worker precondition failed: not all \(count) workers started within 20 s")
+    #expect(try reading.output.get() == "fine\n")
+    #expect(reading.held == count)
 }
 
 @Test func launchFailureSaysWhy() {
@@ -1053,19 +1157,20 @@ func keptArgumentsFollowSameInterpreterReexec(name: String) throws {
     #expect(ProcessSample.topBytes("1.5K") == 1536)
 }
 
-/// top's %CPU is per core: past 100 × the CPU count it is garbage, which would print as inf%.
-@Test func kernelTaskPastEveryCoreIsAnError() throws {
-    let s = sample(at: 10 * second, [identity(0, path: nil)])
-    let t = sample(at: 11 * second, [identity(0, path: nil)])
-    for cpu in [1e300, 1.7e308, 201] {
-        #expect(throws: ProcessSampleError.unparsable(source: .top, line: "kernel_task %CPU \(cpu)")) {
-            try ProcessSample.usage(before: s, after: t, cpuCount: 2,
-                                    kernelTask: KernelTaskSample(cpuPercentPerCore: cpu, residentBytes: 0))
-        }
+/// Bad cached top data must not discard the independently measured process rows.
+@Test func invalidKernelTaskKeepsOtherProcessRows() throws {
+    let processes = [identity(0, path: nil), identity(42)]
+    let s = sample(at: 10 * second, processes, taskInfo: [42: counters(0)])
+    let t = sample(at: 11 * second, processes, taskInfo: [42: counters(second)])
+    for cpu in [1e300, 1.7e308, 201, -.infinity, .infinity, .nan, -1] {
+        let rows = try ProcessSample.usage(before: s, after: t, cpuCount: 2,
+                                           kernelTask: KernelTaskSample(cpuPercentPerCore: cpu, residentBytes: 0))
+        #expect(rows.map(\.pid) == [42])
+        #expect(rows.map(\.cpuPercent) == [50])
     }
     let rows = try ProcessSample.usage(before: s, after: t, cpuCount: 2,
                                        kernelTask: KernelTaskSample(cpuPercentPerCore: 200, residentBytes: 0))
-    #expect(rows.map(\.cpuPercent) == [100])
+    #expect(rows.map(\.cpuPercent) == [100, 50])
 }
 
 /// `top -l 2 -s 1 -pid 0 -stats pid,cpu,mem`, header block trimmed; the first sample covers no window.

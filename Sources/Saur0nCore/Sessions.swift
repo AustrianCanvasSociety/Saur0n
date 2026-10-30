@@ -59,12 +59,13 @@ public struct RegistryEntry: Equatable, Sendable {
     static func startSeconds(_ text: String) -> UInt64? {
         let parts = text.split(separator: " ", omittingEmptySubsequences: true)
         guard parts.count == 5, weekdays.contains(parts[0]), let month = months.firstIndex(of: String(parts[1])),
-              let day = Int32(parts[2]), let year = Int32(parts[4]) else { return nil }
+              let day = Int32(parts[2]), let year = Int(parts[4]), year >= 1970,
+              let tmYear = Int32(exactly: year - 1900) else { return nil }
         let clock = parts[3].split(separator: ":", omittingEmptySubsequences: false)
         guard clock.count == 3, clock.allSatisfy({ $0.count == 2 }),
               let hour = Int32(clock[0]), let minute = Int32(clock[1]), let second = Int32(clock[2]) else { return nil }
         var parsed = tm()
-        (parsed.tm_year, parsed.tm_mon, parsed.tm_mday) = (year - 1900, Int32(month), day)
+        (parsed.tm_year, parsed.tm_mon, parsed.tm_mday) = (tmYear, Int32(month), day)
         (parsed.tm_hour, parsed.tm_min, parsed.tm_sec) = (hour, minute, second)
         var normalised = parsed
         let seconds = timegm(&normalised)

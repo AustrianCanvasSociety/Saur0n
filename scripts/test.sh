@@ -14,4 +14,15 @@ if [[ "$(xcode-select -p 2>/dev/null)" == *CommandLineTools* ]]; then
     args+=(-Xswiftc -plugin-path -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing)
 fi
 
-exec swift test "${args[@]}" "$@"
+for arg in "$@"; do
+    case "$arg" in
+        --filter|--filter=*|-s|--specifier|--specifier=*|list|-l|--list-tests|--help|-help|-h|--version)
+            exec swift test "${args[@]}" "$@"
+            ;;
+    esac
+done
+
+# Pool saturation needs its own pass: other tests can prevent its workers from starting.
+isolated_test=commandIsReadWhileEveryWorkerThreadIsBusy
+swift test "${args[@]}" "$@" --skip "$isolated_test"
+exec swift test "${args[@]}" "$@" --filter "$isolated_test"

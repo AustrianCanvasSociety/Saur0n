@@ -58,6 +58,12 @@ private let idDead = "dddddddd-0000-4000-8000-000000000000"
     #expect(RegistryEntry.startSeconds("") == nil)
 }
 
+@Test func registryStartRejectsExtremeYears() {
+    for year in ["-2147483648", "-9223372036854775808", "9223372036854775807", "2147485548"] {
+        #expect(RegistryEntry.startSeconds("Thu Jan 1 00:00:00 \(year)") == nil)
+    }
+}
+
 @Test func nearestRegisteredAncestor() {
     // claude A (10) → zsh (11) → claude B (12) → cargo (13) → test binary (14).
     let rows = [row(10, name: "claude"), row(11, parent: 10, name: "zsh"), row(12, parent: 11, name: "claude"),
@@ -124,6 +130,22 @@ private let idDead = "dddddddd-0000-4000-8000-000000000000"
 
 @Test func tmuxPanesParse() {
     #expect(SessionGroups.parseTmuxPanes("21 orch line\n23 scratch\n\nbad\n-4 neg\n24 \n") == [21: "orch line", 23: "scratch"])
+}
+
+@Test func tmuxPanesReadSuccessAndFailure() {
+    let success = ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "printf '21 orch line\\n23 scratch\\n'"])
+    #expect(SystemReaders.tmuxPanes(success, deadline: 2) == [21: "orch line", 23: "scratch"])
+    let failure = ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "printf '21 partial\\n'; exit 1"])
+    #expect(SystemReaders.tmuxPanes(failure, deadline: 2).isEmpty)
+    let missing = ProcessReaders.Command(path: "/nonexistent/example-tmux", arguments: [])
+    #expect(SystemReaders.tmuxPanes(missing, deadline: 2).isEmpty)
+}
+
+@Test func tmuxPanesReadKillsATerminationIgnoringClient() {
+    let command = ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", "trap '' TERM; exec /bin/sleep 2"])
+    #expect(SystemReaders.tmuxPanes(command, deadline: 0.2).isEmpty)
+    #expect(command.process.terminationReason == .uncaughtSignal)
+    #expect(command.process.terminationStatus == SIGKILL)
 }
 
 @Test func rootLoginUnderATerminalTab() {

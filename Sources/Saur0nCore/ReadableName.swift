@@ -28,7 +28,9 @@ public enum ReadableName {
         let env = arguments?.environment ?? [:]
 
         if parent == "deps", let target = rustTarget(base) {
-            let crate = env["CARGO_PKG_NAME"] ?? parts.firstIndex(of: "target").flatMap { $0 > 0 ? parts[$0 - 1] : nil }
+            let targetOffset = [4, 5].first { parts.count > $0 && parts[parts.count - $0] == "target" }
+            let folder = targetOffset.map { parts[parts.count - $0 - 1] }
+            let crate = env["CARGO_PKG_NAME"] ?? folder
             let kind = argv.contains("--bench") ? "bench" : "test"
             return "\(kind): \(target)" + (crate.map { " · \($0)" } ?? "")
         }

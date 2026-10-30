@@ -16,6 +16,34 @@ public struct TickSampler: Sendable {
     }
 }
 
+/// The window's load reads: retry topology after any failure and start a fresh interval on recovery.
+public struct LoadSampler: Sendable {
+    public private(set) var topology: CoreTopology?
+    private var sampler = TickSampler()
+
+    public init() {}
+
+    /// A failed read throws for this tick only. The next call reads topology again; its ticks open a new window.
+    public mutating func next(topology readTopology: () throws -> CoreTopology,
+                              ticks readTicks: () throws -> [CPUTicks]) throws -> CPULoad? {
+        do {
+            let topology = try topology ?? readTopology()
+            let ticks = try readTicks()
+            let count = topology.cpusByLevel.joined().count
+            guard ticks.count == count, topology.cpusByLevel.joined().allSatisfy(ticks.indices.contains) else {
+                throw CPULoadError.topologyMismatch(topologyCPUs: count, sampledCPUs: ticks.count)
+            }
+            let load = try sampler.next(ticks)
+            self.topology = topology
+            return load
+        } catch {
+            topology = nil
+            sampler = TickSampler()
+            throw error
+        }
+    }
+}
+
 /// The last `capacity` loads, per CPU, per core type (the mean of its CPUs) and for the whole machine:
 /// what the window's graphs and strips draw. Oldest point first.
 public struct CPUHistory: Equatable, Sendable {
@@ -39,7 +67,8 @@ public struct CPUHistory: Equatable, Sendable {
     /// Adds one point to every series. A load that does not cover the topology's CPUs is an error and
     /// changes nothing.
     public mutating func append(_ load: CPULoad) throws {
-        guard load.perCPU.count == perCPU.count else {
+        guard load.perCPU.count == perCPU.count,
+              topology.cpusByLevel.joined().allSatisfy(load.perCPU.indices.contains) else {
             throw CPULoadError.topologyMismatch(topologyCPUs: perCPU.count, sampledCPUs: load.perCPU.count)
         }
         for cpu in perCPU.indices { Self.push(load.perCPU[cpu], onto: &perCPU[cpu]) }
