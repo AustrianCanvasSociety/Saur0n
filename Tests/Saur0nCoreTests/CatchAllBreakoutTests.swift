@@ -68,7 +68,7 @@ private func broken(_ rows: [ProcessUsage] = machine(), _ limits: CatchAllBreako
     let repo = byRepo(rows)
     let session = bySession(repo.rows)
     let out = CatchAllBreakout.apply(rows: session.rows, repoGroups: repo.groups, sessionGroups: session.groups,
-                                     thresholds: limits)
+                                     thresholds: limits, isAppBundle: { _ in true })
     return (out.rows, out.repoGroups, out.sessionGroups)
 }
 
@@ -80,12 +80,45 @@ private func group(_ groups: [RepoGroup], _ name: String) throws -> RepoGroup {
 
 @Test func outermostAppBundleNamesTheApp() {
     #expect(CatchAllBreakout.appName(ofPath: "/Applications/Outer.app/Contents/Frameworks/Middle.app/Contents/Helpers/"
-                                     + "Inner.app/Contents/MacOS/inner") == "Outer")
-    #expect(CatchAllBreakout.appName(ofPath: firefox + "plugin-container.app/Contents/MacOS/plugin-container") == "Firefox")
+                                     + "Inner.app/Contents/MacOS/inner", isAppBundle: { _ in true }) == "Outer")
+    #expect(CatchAllBreakout.appName(ofPath: firefox + "plugin-container.app/Contents/MacOS/plugin-container",
+                                    isAppBundle: { _ in true }) == "Firefox")
     #expect(CatchAllBreakout.appName(ofPath: "/usr/libexec/trustd") == nil)
     #expect(CatchAllBreakout.appName(ofPath: "/bin/zsh") == nil)
     #expect(CatchAllBreakout.appName(ofPath: nil) == nil)
     #expect(CatchAllBreakout.appName(ofPath: "/opt/tools/notes.application/bin/run") == nil)
+}
+
+@Test func appBreakoutRecognisesMixedCaseBundlesAndRejectsOrdinaryAppFolders() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".app")
+    defer { try? FileManager.default.removeItem(at: root) }
+    for (folder, info) in [("Mixed.ApP", ["CFBundleExecutable": "example", "CFBundlePackageType": "APPL"]),
+                           ("Implicit.APP", ["CFBundleExecutable": "example"]),
+                           ("Ordinary.app", [:]),
+                           ("MissingExec.app", ["CFBundlePackageType": "APPL"]),
+                           ("Empty.app", ["CFBundleExecutable": "", "CFBundlePackageType": "APPL"]),
+                           ("Wrong.app", ["CFBundleExecutable": "example", "CFBundlePackageType": "BNDL"])] {
+        let contents = root.appendingPathComponent(folder + "/Contents")
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try data.write(to: contents.appendingPathComponent("Info.plist"))
+        let path = contents.appendingPathComponent("MacOS/example").path
+        let expected = folder == "Mixed.ApP" ? "Mixed" : folder == "Implicit.APP" ? "Implicit" : nil
+        #expect(CatchAllBreakout.appName(ofPath: path) == expected)
+        let output = CatchAllBreakout.apply(rows: [row(2000, path, rss: mib)], repoGroups: [], sessionGroups: [],
+                                            thresholds: thresholds())
+        #expect(output.rows.first?.app == expected)
+    }
+    #expect(CatchAllBreakout.appName(ofPath: root.appendingPathComponent("Missing.app/bin/tool").path) == nil)
+}
+
+@Test func appBreakoutChecksEachCandidateBundleOnlyOncePerRefresh() {
+    var reads: [String] = []
+    let rows = [row(2000, firefox + "firefox", rss: mib), row(2001, firefox + "helper", rss: mib)]
+    let output = CatchAllBreakout.apply(rows: rows, repoGroups: [], sessionGroups: [], thresholds: thresholds(),
+        isAppBundle: { reads.append($0); return true })
+    #expect(output.rows.map(\.app) == ["Firefox", "Firefox"])
+    #expect(reads == ["/Applications/Firefox.app"])
 }
 
 // MARK: the lift

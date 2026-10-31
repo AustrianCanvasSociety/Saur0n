@@ -482,7 +482,8 @@ private func brokenFixture(_ edit: (inout [ProcessUsage], inout [Int32: String])
     let out = CatchAllBreakout.apply(rows: sessions.rows, repoGroups: grouped.groups, sessionGroups: sessions.groups,
                                      thresholds: CatchAllBreakout.Thresholds(physicalMemoryBytes: 128 << 30,
                                                                              machineDiskBytesPerSecond: nil,
-                                                                             machineNetworkBytesPerSecond: nil))
+                                                                             machineNetworkBytesPerSecond: nil),
+                                     isAppBundle: { _ in true })
     return (out.rows, out.repoGroups, out.sessionGroups)
 }
 

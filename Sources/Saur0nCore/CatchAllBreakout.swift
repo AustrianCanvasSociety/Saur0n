@@ -8,8 +8,8 @@ import Foundation
 /// named after it, the copies of one command (Phase 6 Step 3), as Task Manager and Activity Monitor go by process
 /// name; a sub-group or a bare process that holds at least 1% of the machine's memory, CPU (own +
 /// exited), disk or network rate stands on its own line; everything else folds under one "N other processes" line.
-/// Shares of the machine, not sizes, so one rule fits a 16 GB Air and a 128 GB Pro. Pure: the CLI and the window
-/// call it once after the groups are made.
+/// Shares of the machine, not sizes, so one rule fits a 16 GB Air and a 128 GB Pro. The CLI and the window call it
+/// once after the groups are made; application metadata is read at most once per candidate bundle per call.
 public enum CatchAllBreakout {
     /// The machine's totals the lift is measured against. CPU needs none: 100% is the whole machine.
     public struct Thresholds: Equatable, Sendable {
@@ -67,11 +67,27 @@ extension CatchAllBreakout.Subgroup: Encodable {
 
 extension CatchAllBreakout {
 
-    /// The outermost path component ending in `.app`, without the suffix: a helper bundle nested inside another app's
-    /// `Contents/` belongs to the outer app. nil for a path in no app bundle, or none.
+    /// The outermost application bundle, without its case-insensitive suffix. A nested helper belongs to the outer
+    /// app; an ordinary folder named `.app` does not qualify without application metadata.
     public static func appName(ofPath path: String?) -> String? {
-        guard let path else { return nil }
-        return path.split(separator: "/").first { $0.hasSuffix(".app") && $0.count > 4 }.map { String($0.dropLast(4)) }
+        appName(ofPath: path, isAppBundle: isApplicationBundle)
+    }
+
+    static func appName(ofPath path: String?, isAppBundle: (String) -> Bool) -> String? {
+        guard let path, path.hasPrefix("/") else { return nil }
+        let parts = path.split(separator: "/")
+        for index in parts.indices where parts[index].count > 4 && parts[index].lowercased().hasSuffix(".app") {
+            let root = "/" + parts[...index].joined(separator: "/")
+            if isAppBundle(root) { return String(parts[index].dropLast(4)) }
+        }
+        return nil
+    }
+
+    private static func isApplicationBundle(_ root: String) -> Bool {
+        guard let info = DescriptionSources.plistDictionary(root + "/Contents/Info.plist"),
+              let executable = info["CFBundleExecutable"] as? String, !executable.isEmpty else { return false }
+        // Apple permits an absent package type, inferred from the extension, but an explicit non-app type is not one.
+        return info["CFBundlePackageType"] == nil || info["CFBundlePackageType"] as? String == "APPL"
     }
 
     /// Whether figures stand on their own line: the shown CPU (one decimal) at least 1.0%, or the memory at least 1%
@@ -95,9 +111,22 @@ extension CatchAllBreakout {
     /// session and VMs groups keep `subgroups` empty.
     public static func apply(rows: [ProcessUsage], repoGroups: [RepoGroup], sessionGroups: [SessionGroup],
                              thresholds: Thresholds) -> (rows: [ProcessUsage], repoGroups: [RepoGroup], sessionGroups: [SessionGroup]) {
+        apply(rows: rows, repoGroups: repoGroups, sessionGroups: sessionGroups, thresholds: thresholds,
+              isAppBundle: isApplicationBundle)
+    }
+
+    static func apply(rows: [ProcessUsage], repoGroups: [RepoGroup], sessionGroups: [SessionGroup],
+                      thresholds: Thresholds, isAppBundle: (String) -> Bool)
+        -> (rows: [ProcessUsage], repoGroups: [RepoGroup], sessionGroups: [SessionGroup]) {
+        var bundles: [String: Bool] = [:]
         let rows = rows.map { row in
             var row = row
-            row.app = appName(ofPath: row.path)
+            row.app = appName(ofPath: row.path) { root in
+                if let cached = bundles[root] { return cached }
+                let valid = isAppBundle(root)
+                bundles[root] = valid
+                return valid
+            }
             return row
         }
         let byPid = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })

@@ -1263,7 +1263,8 @@ private func sessioned() -> (rows: [ProcessUsage], repoGroups: [RepoGroup], sess
     let out = CatchAllBreakout.apply(rows: grouped.rows, repoGroups: grouped.groups, sessionGroups: [],
                                      thresholds: CatchAllBreakout.Thresholds(physicalMemoryBytes: 1 << 37,
                                                                              machineDiskBytesPerSecond: nil,
-                                                                             machineNetworkBytesPerSecond: nil))
+                                                                             machineNetworkBytesPerSecond: nil),
+                                     isAppBundle: { _ in true })
     let snapshot = try Snapshot(topology: CoreTopology.singleLevel(logicalCPUCount: 1),
                                 load: CPULoad(perCPU: [0], total: 0), intervalSeconds: 1,
                                 processes: out.rows, repoGroups: out.repoGroups)
