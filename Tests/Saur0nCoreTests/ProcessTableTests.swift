@@ -615,6 +615,7 @@ private func brokenFixture(_ edit: (inout [ProcessUsage], inout [Int32: String])
     // beta's only process exited: the group line stays, gone, with its gone member.
     let beta = try #require(kept.first { $0.name == "beta" })
     #expect(beta.gone && beta.children?.allSatisfy { $0.gone } == true)
+    #expect(beta.count == 0)
     #expect(kept.map(\.id) == before.map(\.id))
     // Still there on the refresh after, then gone once the table is built afresh (a sort change or a fold).
     let again = table(exited, sort: byName, previous: kept)
@@ -638,6 +639,17 @@ private func brokenFixture(_ edit: (inout [ProcessUsage], inout [Int32: String])
     #expect(after.first { $0.name == "alpha" }?.children?.map(\.pid) == [10, 12])
     #expect(after.contains { $0.name == "beta" } == false)
     #expect(allLines(after).allSatisfy { !$0.gone })
+}
+
+@Test func omittedTableClockStillExpiresGreyedRows() {
+    let byName = ProcessTable.Sort(column: .name, ascending: true)
+    let exited = fixture { rows, _ in rows.removeAll { $0.pid == 20 } }
+    let old = ProcessInfo.processInfo.systemUptime - ProcessTable.goneSeconds - 1
+    let previous = table(exited, sort: byName, previous: table(fixture(), sort: byName), now: old)
+    #expect(previous.contains { $0.name == "beta" && $0.gone })
+    let shown = ProcessTable.lines(rows: exited.rows, repoGroups: exited.repo, sessionGroups: exited.session,
+                                   grouping: .repo, sort: byName, unattributedCpuPercent: nil, previous: previous)
+    #expect(!shown.contains { $0.name == "beta" })
 }
 
 @Test func aProcessThatMovedGroupLeavesNoGreyedCopyBehind() throws {

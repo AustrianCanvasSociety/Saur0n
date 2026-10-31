@@ -81,9 +81,13 @@ final class MonitorModel {
     }
     /// The toolbar's Pause: while set, the loop takes no samples and the window keeps its last refresh.
     var paused = false {
-        didSet { pause.setPaused(paused) }
+        didSet {
+            windowReading.setPaused(paused)
+            pause.setPaused(paused)
+        }
     }
     let pause = RefreshPause()
+    private var windowReading = WindowReadingState()
     /// Which groups are open: each group's default, or all closed / all open after the toolbar's fold button,
     /// with the groups the user toggled since flipped (`ProcessTable.Folding`).
     private var folding = ProcessTable.Folding()
@@ -214,6 +218,7 @@ final class MonitorModel {
         let statusPublisher = ResourceStatusProducer(url: ResourceStatusProducer.defaultURL())
         while !Task.isCancelled {
             let held = await model.pause.waitWhilePaused()
+            let ticket = await model.windowReading.ticket
             let ignoring = await model.ignoring
             let load = Result { try sampler.next(topology: SystemReaders.coreTopology, ticks: SystemReaders.cpuTicks) }
             if let topology = sampler.topology {
@@ -263,7 +268,7 @@ final class MonitorModel {
             }
             if !held {
                 await model.deliver(Reading(load: load, processes: processes, topology: sampler.topology,
-                                            sampledAt: sampledAt, level: level))
+                                            sampledAt: sampledAt, level: level), ticket: ticket)
             }
             await model.pause.sleep(seconds: 1)
         }
@@ -329,18 +334,18 @@ final class MonitorModel {
     /// The Dock icon takes it either way: it is the signal while the window is behind other apps. Occlusion and the
     /// screen lock quiet *this* — the rendering — and nothing upstream of it: the loop, the engine and the watcher run
     /// the same with no window at all (Phase 7 Step 1, calibration lock 2).
-    private func deliver(_ reading: Reading) {
+    private func deliver(_ reading: Reading, ticket: Int) {
         // The reading's own time and level, not the publication's outcome: a failed write does not hide a completed
         // reading.
         if let sampledAt = reading.sampledAt { lastReadingAt = sampledAt }
         resourceLevel = reading.level
-        guard !paused || readingWhilePaused else { return }    // sampled before Pause was pressed
-        readingWhilePaused = false
+        guard let keepHistory = windowReading.accept(ticket) else { return }
+        let points = keepHistory ? reading.points : nil
         if case .success(let refresh?) = reading.processes {
             dock.show(refresh.dock, badge: DockLevel.badge(refresh.warnings, ignoring: ignoring))
         }
-        guard quiet.quiet else { return show(reading, points: reading.points.map { [$0] } ?? []) }
-        if let points = reading.points { quiet.hold(points) }
+        guard quiet.quiet else { return show(reading, points: points.map { [$0] } ?? []) }
+        if let points { quiet.hold(points) }
         heldReading = reading
     }
 
@@ -421,7 +426,7 @@ final class MonitorModel {
     }
 
     nonisolated static func lines(_ refresh: ProcessRefresh, grouping: ProcessTable.Grouping, sort: ProcessTable.Sort,
-                                  pausedPids: Set<Int32> = [], now: Double = 0,
+                                  pausedPids: Set<Int32> = [], now: Double = ProcessInfo.processInfo.systemUptime,
                                   previous: [ProcessTable.Line] = [], warnings: [Warning] = []) -> [ProcessTable.Line] {
         ProcessTable.lines(rows: refresh.rows, repoGroups: refresh.repoGroups, sessionGroups: refresh.sessionGroups,
                            commandGroups: refresh.commandGroups, grouping: grouping, sort: sort, unattributedCpuPercent: refresh.unattributedCpuPercent,
@@ -474,13 +479,12 @@ final class MonitorModel {
     func refresh() {
         rebuildLines(keepingOrder: false)
         resortNextReading = true
-        if paused { readingWhilePaused = true }
+        windowReading.refresh()
         pause.refreshNow()
     }
 
-    /// Set by Refresh: the next reading builds the table afresh, and is shown though the window is paused.
+    /// Set by Refresh: the next reading builds the table afresh.
     private var resortNextReading = false
-    private var readingWhilePaused = false
 
     /// The table's header sort as `ProcessTable.Sort`; CPU, highest first, when none is set.
     static func sort(_ order: [KeyPathComparator<ProcessTable.Line>]) -> ProcessTable.Sort {

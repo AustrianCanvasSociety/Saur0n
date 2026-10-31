@@ -308,7 +308,7 @@ public enum ProcessTable {
     public static func lines(rows: [ProcessUsage], repoGroups: [RepoGroup], sessionGroups: [SessionGroup],
                              commandGroups: [CommandGroup] = [], grouping: Grouping, sort: Sort = .cliOrder, unattributedCpuPercent: Double?,
                              unattributedHint: String? = nil, unattributedDisk: DiskRate? = nil, kernelTaskAge: Int? = nil,
-                             pausedPids: Set<Int32> = [], now: Double = 0, previous: [Line] = [],
+                             pausedPids: Set<Int32> = [], now: Double = ProcessInfo.processInfo.systemUptime, previous: [Line] = [],
                              warnings: [Warning] = []) -> [Line] {
         let byPid = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
         let sections = sections(rows: rows, repoGroups: repoGroups, sessionGroups: sessionGroups,
@@ -489,6 +489,7 @@ public enum ProcessTable {
             guard line.kind != .subgroup, !shown.contains(line.id), now - since < goneSeconds else { return nil }
             var line = line
             line.goneSince = since
+            if line.count != nil { line.count = 0 }
             line.paused = false
             line.warnings = []
             if !line.identifier.hasPrefix("gone-") { line.identifier = "gone-" + line.identifier }

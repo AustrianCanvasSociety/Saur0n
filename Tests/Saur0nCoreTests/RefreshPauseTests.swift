@@ -144,6 +144,39 @@ func refreshWhilePausedLetsOneReadingThroughAndStaysPaused(seconds: Double) asyn
     #expect(await second.value == true)
 }
 
+@Test func manualRefreshShowsRowsWithoutAddingHistoryTicks() {
+    var state = WindowReadingState()
+    #expect(state.accept(state.ticket) == true)
+    for paused in [false, true] {
+        state.setPaused(paused)
+        state.refresh()
+        #expect(state.accept(state.ticket) == false)
+    }
+    state.setPaused(false)
+    #expect(state.accept(state.ticket) == true)
+}
+
+@Test func resumeThenPauseCancelsThePendingManualReading() {
+    var state = WindowReadingState()
+    state.setPaused(true)
+    state.refresh()
+    let requested = state.ticket
+    state.setPaused(false)
+    state.setPaused(true)
+    #expect(state.accept(requested) == nil)
+    #expect(state.accept(state.ticket) == nil)
+}
+
+@Test func prePauseReadingCannotConsumeAPausedRefresh() {
+    var state = WindowReadingState()
+    let inFlight = state.ticket
+    state.setPaused(true)
+    state.refresh()
+    #expect(state.accept(inFlight) == nil)
+    #expect(state.accept(state.ticket) == false)
+    #expect(state.accept(state.ticket) == nil)
+}
+
 // MARK: Quiet — no window updates while the screen is locked or the app can't be seen
 
 @Test func quietWhileLockedOrHidden() {

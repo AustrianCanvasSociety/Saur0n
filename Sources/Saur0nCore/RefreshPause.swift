@@ -107,6 +107,35 @@ public final class RefreshPause: Sendable {
     }
 }
 
+/// The window's reading policy, separate from sampling and the watcher. A toolbar action invalidates readings
+/// already in flight; Refresh shows one new reading without adding an extra graph point or strip tick.
+public struct WindowReadingState: Sendable {
+    public private(set) var ticket = 0
+    private var paused = false
+    private var requested = false
+
+    public init() {}
+
+    public mutating func setPaused(_ paused: Bool) {
+        guard self.paused != paused else { return }
+        self.paused = paused
+        requested = false
+        ticket += 1
+    }
+
+    public mutating func refresh() {
+        requested = true
+        ticket += 1
+    }
+
+    /// nil rejects an old or paused reading; false shows its rows only; true also advances the histories.
+    public mutating func accept(_ ticket: Int) -> Bool? {
+        guard ticket == self.ticket, !paused || requested else { return nil }
+        defer { requested = false }
+        return !requested
+    }
+}
+
 /// Counts applied process readings, not attempts: a failed scan or an opening sample has no new rows to show.
 public struct RefreshProgress: Sendable {
     public private(set) var count = 0
