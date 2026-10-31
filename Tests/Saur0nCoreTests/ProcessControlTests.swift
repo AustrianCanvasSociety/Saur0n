@@ -368,8 +368,45 @@ func anAdministratorBatchReportsRefusedPidsWithoutRunningAPartialCommand(_ pid: 
 @Test func anAdministratorBatchKeepsEveryAllowedCommand() {
     let batch = ProcessControl.AdministratorBatch(signal: SIGSTOP, rows: [row(123, "sleep"), row(124, "sleep")],
                                                   ownPid: own)
-    #expect(batch.command == "kill -STOP 123; kill -STOP 124")
+    #expect(batch.command?.contains("kill -STOP 123") == true)
+    #expect(batch.command?.contains("kill -STOP 124") == true)
     #expect(batch.error == nil)
+}
+
+@Test(arguments: ["Thu Jan  1 00:00:01 1970    ", "Thu Jan  1 00:00:02 1970    ", ""])
+func anAdministratorCommandRechecksIdentityInsideTheShell(_ observed: String) throws {
+    let batch = ProcessControl.AdministratorBatch(signal: SIGSTOP,
+        rows: [row(123, "sleep", start: 1_234_567)], ownPid: own)
+    let command = try #require(batch.command)
+    #expect(command.contains("LC_ALL=C TZ=UTC0 /bin/ps -o lstart= -p 123"))
+    #expect(command.contains("'Thu Jan 1 00:00:01 1970'"))
+    // Execute the generated shell grammar, replacing only the process read and signal with harmless fixtures.
+    let fixture = "identity_probe() { echo '\(observed)'; }; kill() { echo signalled; }; "
+        + command.replacingOccurrences(of: "/bin/ps", with: "identity_probe")
+    let process = try ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", fixture]).start()
+    if observed.contains("00:00:01") {
+        #expect(try ProcessReaders.run(process).trimmingCharacters(in: .whitespacesAndNewlines) == "signalled")
+    } else {
+        #expect(throws: (any Error).self) { try ProcessReaders.run(process) }
+    }
+}
+
+@Test func anAdministratorBatchStopsAfterAnIdentityMismatchOrSignalFailure() throws {
+    let batch = ProcessControl.AdministratorBatch(signal: SIGTERM,
+        rows: [row(123, "sleep", start: 1_234_567), row(124, "sleep", start: 1_234_567)], ownPid: own)
+    let command = try #require(batch.command).replacingOccurrences(of: "/bin/ps", with: "identity_probe")
+    for fixture in ["identity_probe() { echo read-$4 >&2; return 1; }; kill() { echo unexpected-signal >&2; }; ",
+                    "identity_probe() { echo 'Thu Jan  1 00:00:01 1970'; }; kill() { echo signal-$* >&2; return 7; }; "] {
+        let process = try ProcessReaders.Command(path: "/bin/sh", arguments: ["-c", fixture + command]).start()
+        do {
+            _ = try ProcessReaders.run(process)
+            Issue.record("the administrator batch must fail")
+        } catch let ProcessReadError.command(_, status, stderr) {
+            #expect(status != 0)
+            #expect(!stderr.contains("124"))
+            #expect(!stderr.contains("unexpected-signal"))
+        }
+    }
 }
 
 @Test func aGroupHoldingSaur0nDropsItAndSignalsTheRest() {

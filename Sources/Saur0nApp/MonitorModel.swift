@@ -623,9 +623,9 @@ final class MonitorModel {
         pending = sheet
     }
 
-    /// The administrator path for the processes macOS refused: `kill -<signal> <pid>` for each, checked again against
-    /// a fresh process list, run as root by AppleScript's `do shell script … with administrator privileges` — the
-    /// system's own password dialog, nothing stored (research 2026-10-20 § Q2).
+    /// The administrator path for the processes macOS refused: selection checked against a fresh process list,
+    /// then each start checked again inside the root shell after the system's password dialog.
+    /// Nothing stored (research 2026-10-20 § Q2).
     func confirmAsAdministrator() {
         guard var sheet = pending, !sheet.denied.isEmpty else { return }
         let selection = ProcessControl.AdministratorSelection(rows: sheet.denied, read: ProcessControl.currentIdentities)

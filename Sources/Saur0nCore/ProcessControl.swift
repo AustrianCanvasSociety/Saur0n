@@ -522,7 +522,7 @@ public enum ProcessControl {
             var commands: [String] = [], failures: [String] = []
             for row in rows {
                 do {
-                    commands.append(try administratorCommand(signal: signal, pid: row.pid, ownPid: ownPid))
+                    commands.append(try guardedAdministratorCommand(signal: signal, row: row, ownPid: ownPid))
                 } catch let error as ProcessControlError {
                     failures.append(message(error, name: row.name, pid: row.pid))
                 } catch {
@@ -535,7 +535,22 @@ public enum ProcessControl {
         }
     }
 
-    /// The command the administrator path runs as root: `kill -TERM 123` — the signal's name and the pid as an
+    /// Runs after authorization, with a fresh whole-second start check immediately before each signal.
+    /// Fixed locale/time zone and whitespace normalization match ps's padded lstart column. A failed read or
+    /// mismatch exits the batch; a failed signal must not be hidden by a later successful command.
+    private static func guardedAdministratorCommand(signal: Int32, row: ProcessUsage, ownPid: Int32) throws -> String {
+        let signalCommand = try administratorCommand(signal: signal, pid: row.pid, ownPid: ownPid)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        let start = formatter.string(from: Date(timeIntervalSince1970: Double(row.startMicroseconds / 1_000_000)))
+        return "case $(LC_ALL=C TZ=UTC0 /bin/ps -o lstart= -p \(row.pid) | /usr/bin/xargs) in "
+            + "'\(start)') \(signalCommand) || exit $? ;; "
+            + "*) echo 'process identity changed or unreadable (pid \(row.pid))' >&2; exit 1 ;; esac"
+    }
+
+    /// The signal fragment used by the guarded administrator batch: `kill -TERM 123` — the signal's name and the pid as an
     /// integer, nothing a name or path could inject. A pid `refusal` names throws `.refused` (as root, `kill -TERM 0`
     /// would signal the caller's process group and `kill -TERM -1` every process).
     public static func administratorCommand(signal: Int32, pid: Int32,
