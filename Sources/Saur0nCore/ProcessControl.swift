@@ -15,6 +15,7 @@ public enum ProcessControlError: Error, Equatable, Sendable {
     /// Never signalled from the window: kernel_task, launchd or Saur0n itself (`ProcessControl.refusal`).
     case refused(reason: String)
     case failed(errno: Int32)
+    case unexpected(message: String)
 }
 
 /// Sends one signal to one pid; the window uses `KillSignaller`, the tests a recorder.
@@ -414,7 +415,7 @@ public enum ProcessControl {
             } catch let error as ProcessControlError {
                 return Outcome(pid: pid, result: .failure(error))
             } catch {
-                return Outcome(pid: pid, result: .failure(.failed(errno: EINVAL)))
+                return Outcome(pid: pid, result: .failure(.unexpected(message: String(describing: error))))
             }
         }
     }
@@ -446,6 +447,7 @@ public enum ProcessControl {
         case .appRefused: "\(name) (pid \(pid)) did not take the request"
         case .refused(let reason): "\(name) (pid \(pid)): \(reason)"
         case .failed(let code): "\(name) (pid \(pid)): \(String(cString: strerror(code)))"
+        case .unexpected(let detail): "\(name) (pid \(pid)): \(detail)"
         }
     }
 
@@ -474,6 +476,39 @@ public enum ProcessControl {
     /// `launchctl list` now; nil when it fails.
     public static func launchctlList() -> String? {
         try? ProcessReaders.run(ProcessReaders.Command(path: "/bin/launchctl", arguments: ["list"]).start())
+    }
+
+    /// Unknown launchd jobs must not read as a successful empty listing.
+    public struct LaunchdWarning: Equatable, Sendable {
+        public let message: String?
+
+        public init(rows: [ProcessUsage], listing: String?) {
+            guard rows.contains(where: { $0.ppid == 1 }) else { message = nil; return }
+            guard let listing else {
+                message = "launchd jobs unreadable; a selected process may come back"
+                return
+            }
+            message = rows.contains { launchdManaged($0.pid, ppid: $0.ppid, launchctlList: listing) }
+                ? "launchd started it; it may come back" : nil
+        }
+    }
+
+    /// nil rows mean the read failed, not that the refused processes are gone; the window keeps its offer.
+    public struct AdministratorSelection {
+        public let rows: [ProcessUsage]?
+        public let error: String?
+
+        public init(rows: [ProcessUsage], read: () throws -> [ProcessIdentity]) {
+            do {
+                let current = try read()
+                let live = rows.filter { verify(ProcessTable.rowID($0), in: current) != nil }
+                self.rows = live
+                error = live.isEmpty ? "the refused processes are gone" : nil
+            } catch {
+                self.rows = nil
+                self.error = "cannot read the process list: \(error)"
+            }
+        }
     }
 
     /// An administrator action is either a complete command or an explanation; a refused pid never disappears into

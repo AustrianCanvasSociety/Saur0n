@@ -567,8 +567,7 @@ final class MonitorModel {
         pending = sheet
         let rows = latest.rows, id = sheet.id
         Task.detached(priority: .userInitiated) { [weak self] in
-            let launchctl = ProcessControl.launchctlList() ?? ""
-            let keepAlive = targets.contains { ProcessControl.launchdManaged($0.pid, ppid: $0.ppid, launchctlList: launchctl) }
+            let launchdWarning = ProcessControl.LaunchdWarning(rows: targets, listing: ProcessControl.launchctlList())
             let usedBy: [ProcessControl.Dependant]? = (try? NettopRunner.sockets()).map { listing in
                 var seen = Set(pids), out: [ProcessControl.Dependant] = []
                 for pid in pids {
@@ -580,7 +579,7 @@ final class MonitorModel {
             }
             await MainActor.run {
                 guard let self, var sheet = self.pending, sheet.id == id else { return }
-                sheet.keepAlive = keepAlive
+                sheet.launchdWarning = launchdWarning.message
                 sheet.usedBy = usedBy.map { .read($0) } ?? .unreadable
                 self.pending = sheet
             }
@@ -629,11 +628,10 @@ final class MonitorModel {
     /// system's own password dialog, nothing stored (research 2026-10-20 § Q2).
     func confirmAsAdministrator() {
         guard var sheet = pending, !sheet.denied.isEmpty else { return }
-        let current = (try? ProcessControl.currentIdentities()) ?? []
-        let live = sheet.denied.filter { ProcessControl.verify(ProcessTable.rowID($0), in: current) != nil }
-        guard !live.isEmpty else {
-            sheet.error = "the refused processes are gone"
-            sheet.denied = []
+        let selection = ProcessControl.AdministratorSelection(rows: sheet.denied, read: ProcessControl.currentIdentities)
+        guard let live = selection.rows, !live.isEmpty else {
+            sheet.error = selection.error
+            if selection.rows != nil { sheet.denied = [] }
             pending = sheet
             return
         }
@@ -808,8 +806,8 @@ struct PendingAction: Identifiable {
     let spared: [ProcessControl.Dependant]
     let confirmTitle: String
     var usedBy = UsedBy.reading
-    /// launchd started a target; it may come back.
-    var keepAlive = false
+    /// A restart warning, including an unreadable launchd job list.
+    var launchdWarning: String?
     /// The last attempt's failures, one per line.
     var error: String?
     /// The processes macOS refused (EPERM): the administrator path's targets.

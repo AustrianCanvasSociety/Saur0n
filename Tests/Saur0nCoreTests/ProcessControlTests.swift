@@ -194,6 +194,46 @@ func sharedActionsKeepTheExistingBranchAndSiblingOrder(_ action: ProcessControl.
     #expect((try? ProcessControl.administratorCommand(signal: SIGCONT, pid: 7)) == "kill -CONT 7")
 }
 
+@Test func anAdministratorReadFailureKeepsTheTargetsUnknownRatherThanGone() {
+    let targets = [row(123, "sleep")]
+    let selection = ProcessControl.AdministratorSelection(rows: targets) { throw ControlProbeError.unreadable }
+    #expect(selection.rows == nil)
+    #expect(selection.error == "cannot read the process list: unreadable")
+    let gone = ProcessControl.AdministratorSelection(rows: targets) { [] }
+    #expect(gone.rows == [])
+    #expect(gone.error == "the refused processes are gone")
+    let live = ProcessControl.AdministratorSelection(rows: targets) { [identity(targets[0])] }
+    #expect(live.rows == targets)
+    #expect(live.error == nil)
+    let reused = ProcessControl.AdministratorSelection(rows: targets) { [identity(targets[0], start: 999)] }
+    #expect(reused.rows == [])
+}
+
+@Test func anUnreadableLaunchdListDoesNotHideTheRestartWarning() {
+    let targets = [row(123, "sleep", parent: 1)]
+    #expect(ProcessControl.LaunchdWarning(rows: targets, listing: nil).message
+            == "launchd jobs unreadable; a selected process may come back")
+    #expect(ProcessControl.LaunchdWarning(rows: targets, listing: "123\t0\tapp.example.worker").message
+            == "launchd started it; it may come back")
+    #expect(ProcessControl.LaunchdWarning(rows: targets, listing: "").message == nil)
+    #expect(ProcessControl.LaunchdWarning(rows: [row(124, "sleep", parent: 123)], listing: nil).message == nil)
+}
+
+private enum ControlProbeError: Error { case unreadable }
+
+private struct UnexpectedErrorSignaller: ProcessSignaller {
+    func signal(_ sig: Int32, to pid: Int32) throws { throw ControlProbeError.unreadable }
+}
+
+@Test func anUnexpectedSignalErrorRetainsItsActualDescription() {
+    let target = row(123, "sleep")
+    let recorder = Recorder()
+    let outcome = ProcessControl.perform(.pause, on: [target], current: [identity(target)],
+                                         signaller: UnexpectedErrorSignaller(), terminator: recorder.terminator(nil)).first
+    guard case .failure(let error) = outcome?.result else { Issue.record("missing failure"); return }
+    #expect(ProcessControl.message(error, name: target.name, pid: target.pid) == "sleep (pid 123): unreadable")
+}
+
 @Test func aStoppedStatusReadsAsPaused() {
     let rows = [row(1100, "yes"), row(1101, "sleep")]
     let group = RepoGroup(name: "demo", root: "/tmp/demo", cpuPercent: 0, exitedChildrenCpuPercent: 0, residentBytes: 0,

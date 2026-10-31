@@ -447,8 +447,8 @@ struct ActionSheet: View {
                 ForEach(Array(sheet.left.enumerated()), id: \.offset) { i, line in
                     Text(line).foregroundStyle(.secondary).accessibilityIdentifier("left-running-\(i)")
                 }
-                if sheet.keepAlive {
-                    Text("launchd started it; it may come back").foregroundStyle(.secondary).accessibilityIdentifier("keep-alive")
+                if let warning = sheet.launchdWarning {
+                    Text(warning).foregroundStyle(.secondary).accessibilityIdentifier("keep-alive")
                 }
                 if let error = sheet.error {
                     Text(error).foregroundStyle(.red).accessibilityIdentifier("action-error")
